@@ -43,6 +43,42 @@ cargo run --locked --bin 1h-agent -- --workspace /path/to/project
 
 应用每次启动先进入轻量首页。直接输入首条消息并按 `Enter` 会创建新会话并进入主界面；按 `Tab` 可切换到最近会话列表，使用方向键和 `Enter` 恢复会话，也可以直接点击会话标题。首页不会预先创建空会话或加载历史消息。
 
+### Windows 启动脚本
+
+仓库提供 `scripts/run-tui.ps1`（`run-tui.cmd` 为便捷入口），用于本地构建与功能测试：
+
+```powershell
+# 构建并启动，工作区为当前目录
+.\scripts\run-tui.cmd
+
+# 指定工作区与配置文件
+.\scripts\run-tui.cmd -Workspace D:\path\to\project -Config .\config\config.toml
+
+# 先验证编译，不启动
+.\scripts\run-tui.cmd -BuildOnly
+
+# 连本地 core 源码联调（构建后自动还原 Cargo.lock）
+.\scripts\run-tui.cmd -LocalCore -CorePath ..\1H-Agent-core
+
+# 只打印将执行的命令
+.\scripts\run-tui.cmd -DryRun
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `-Workspace` | Agent 可访问的工作区，默认当前目录 |
+| `-Config` | 配置 TOML，默认 `%APPDATA%\1h-agent\config.toml` |
+| `-DataDir` / `-UseDefaultData` | 会话数据库目录，默认仓库内 `.runtime-data` |
+| `-TargetDir` | 构建产物目录 |
+| `-Release` | 构建 release 版本 |
+| `-LocalCore` / `-CorePath` | 临时把 `protium-core` patch 到本地 core 源码 |
+| `-Online` | 允许 cargo 联网，默认离线 |
+| `-BuildOnly` / `-NoBuild` | 只构建 / 只启动 |
+| `-EnvFile` | 从 `KEY=VALUE` 文件加载环境变量（用于注入 Provider API Key） |
+| `-DryRun` | 只打印命令，不构建不启动 |
+
+脚本默认离线并使用 `--locked`，数据目录写入仓库内 `.runtime-data`（已被 `.gitignore` 忽略）。`-LocalCore` 只通过命令行 `--config` 覆盖依赖，不修改 `Cargo.toml`；Cargo 在构建期间会临时改写 `Cargo.lock`，脚本会在构建结束后自动还原。
+
 构建 release 二进制：
 
 ```bash
