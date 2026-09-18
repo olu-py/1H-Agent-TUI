@@ -62,6 +62,11 @@ pub struct ContextView {
     /// by the core. `None` when the model window is unknown.
     pub safe_input: Option<u64>,
     pub percent: Option<u64>,
+    /// Metadata tier the window came from: `config`, `provider`, `community`,
+    /// `registry`, `unknown`.
+    pub window_source: String,
+    /// True when the window is not an explicit user configuration.
+    pub estimated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,22 +239,34 @@ fn shortcuts_width(hints: &[ShortcutHint]) -> usize {
 impl UiViewModel {
     pub fn from_app(app: &App, density: Density, height: HeightClass, footer_width: usize) -> Self {
         let activity = activity_view(app);
+        // Display-only streaming overlay on top of the core-authoritative
+        // anchor. It never feeds request trimming or core state.
+        let overlay = app.current.context_overlay_tokens;
+        let used = app.current.context_used_tokens.saturating_add(overlay);
+        let limit = app.current.context_limit_tokens;
+        let safe_input = app
+            .current
+            .context_budget
+            .as_ref()
+            .and_then(|budget| budget.safe_input_tokens)
+            .map(|safe| safe.saturating_sub(overlay));
         let context = ContextView {
             enabled: app.context_meter_enabled,
-            used: app.current.context_used_tokens,
-            limit: app.current.context_limit_tokens,
-            safe_input: app
+            used,
+            limit,
+            safe_input,
+            percent: limit.map(|limit| used.min(limit.max(1)).saturating_mul(100) / limit.max(1)),
+            window_source: app
                 .current
                 .context_budget
                 .as_ref()
-                .and_then(|budget| budget.safe_input_tokens),
-            percent: app.current.context_limit_tokens.map(|limit| {
-                app.current
-                    .context_used_tokens
-                    .min(limit.max(1))
-                    .saturating_mul(100)
-                    / limit.max(1)
-            }),
+                .map(|budget| budget.window_source.clone())
+                .unwrap_or_else(|| "unknown".into()),
+            estimated: app
+                .current
+                .context_budget
+                .as_ref()
+                .is_some_and(|budget| budget.estimated),
         };
         let profile = app.thinking_profile();
         let thinking = ThinkingControlView {
@@ -412,20 +429,35 @@ fn context_segments(context: &ContextView, density: Density) -> Vec<UiSegment> {
     if !context.enabled {
         return Vec::new();
     }
+    // Unknown window: never guess a capacity; show a safe hint instead.
+    if context.limit.is_none() {
+        let text = if context.used == 0 {
+            "上下文未知".to_owned()
+        } else {
+            format!("上下文未知 · 已用{}", compact_tokens(context.used))
+        };
+        return vec![UiSegment {
+            text,
+            role: VisualRole::Muted,
+        }];
+    }
     let percent = context
         .percent
         .map_or("--".into(), |value| value.to_string());
-    let text = match (density, context.limit, context.safe_input) {
+    let suffix = context_suffix(context);
+    let text = match (density, context.safe_input) {
         // The core-computed safe available input budget is the authoritative
         // capacity; the window is shown for reference.
-        (Density::Compact, _, _) => format!("上下文 {percent}%"),
-        (_, Some(_limit), Some(safe)) => format!("上下文 {percent}% 可用{}", compact_tokens(safe),),
-        (_, Some(limit), None) => format!(
-            "上下文 {percent}% {}/{}",
-            compact_tokens(context.used),
-            compact_tokens(limit)
-        ),
-        (_, None, _) => format!("上下文 {percent}% {}", compact_tokens(context.used)),
+        (Density::Compact, _) => format!("上下文 {percent}%{suffix}"),
+        (_, Some(safe)) => format!("上下文 {percent}% 可用{}{suffix}", compact_tokens(safe)),
+        (_, None) => match context.limit {
+            Some(limit) => format!(
+                "上下文 {percent}% {}/{}{suffix}",
+                compact_tokens(context.used),
+                compact_tokens(limit)
+            ),
+            None => format!("上下文 {percent}% {}{suffix}", compact_tokens(context.used)),
+        },
     };
     vec![UiSegment {
         text,
@@ -439,6 +471,25 @@ fn context_segments(context: &ContextView, density: Density) -> Vec<UiSegment> {
             }
         }),
     }]
+}
+
+/// Short metadata annotation: window tier and, when discovered rather than
+/// explicitly configured, an "estimated" marker.
+fn context_suffix(context: &ContextView) -> String {
+    let source = match context.window_source.as_str() {
+        "config" => "显式配置",
+        "provider" => "Provider",
+        "community" => "models.dev",
+        "registry" => "内置注册表",
+        "unknown" => "未知窗口",
+        other if !other.is_empty() => other,
+        _ => "未知窗口",
+    };
+    if context.estimated {
+        format!(" · {source} · 估算")
+    } else {
+        format!(" · {source}")
+    }
 }
 
 fn compact_tokens(tokens: u64) -> String {

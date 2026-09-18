@@ -107,7 +107,12 @@ pub struct TuiSessionProjection {
     pub(crate) live_thinking_layout_cache: LiveThinkingLayoutCache,
     pub pending_approval: Option<ApprovalDisplay>,
     pub usage: Usage,
+    /// Core-authoritative context usage from the last `ContextUpdated` (or
+    /// snapshot). `Usage` events never mutate this.
     pub context_used_tokens: u64,
+    /// TUI-only bounded overlay for tokens streamed since the last
+    /// `ContextUpdated`; display-only, never used for request trimming.
+    pub context_overlay_tokens: u64,
     pub context_limit_tokens: Option<u64>,
     /// The core-computed context budget for this session; the authority for
     /// the safe-input budget the meter shows.
@@ -169,6 +174,7 @@ impl TuiSessionProjection {
             pending_approval: None,
             usage: Usage::default(),
             context_used_tokens: 0,
+            context_overlay_tokens: 0,
             context_limit_tokens,
             context_budget: None,
             expanded_tools: HashSet::new(),
@@ -205,6 +211,7 @@ impl TuiSessionProjection {
         let mut outcome = ProjectionOutcome::default();
         match event {
             Event::ReasoningDelta { delta } => {
+                self.add_context_overlay(delta);
                 self.agent_phase = AgentPhase::Thinking;
                 self.model_phase = ModelPhase::Streaming;
                 // A mid-reasoning sync (replace_history via ApprovalResolved or
@@ -261,9 +268,11 @@ impl TuiSessionProjection {
                 self.model_phase = ModelPhase::Streaming;
             }
             Event::CompactionCompleted { hidden } => {
+                self.context_overlay_tokens = 0;
                 self.status = format!("上下文已压缩，隐藏 {hidden} 条历史消息");
             }
             Event::CompactionFailed { error } => {
+                self.context_overlay_tokens = 0;
                 self.status = format!("上下文压缩失败，已使用安全裁剪：{error}");
                 self.push_entry(DisplayEntry {
                     kind: DisplayKind::Error,
@@ -349,6 +358,7 @@ impl TuiSessionProjection {
                 outcome.force_redraw = true;
             }
             Event::Cancelled { reason } => {
+                self.context_overlay_tokens = 0;
                 self.finish_thinking("思考已取消");
                 self.mark_partial_if_streaming();
                 self.busy = false;
@@ -365,6 +375,7 @@ impl TuiSessionProjection {
                 };
             }
             Event::TextDelta { delta } => {
+                self.add_context_overlay(delta);
                 self.finish_thinking("思考完成");
                 self.agent_phase = AgentPhase::StreamingText;
                 self.model_phase = ModelPhase::Streaming;
@@ -521,18 +532,18 @@ impl TuiSessionProjection {
                 output_tokens,
                 total_tokens,
             } => {
+                // Usage is display-only: the context meter is anchored to the
+                // core's ContextUpdated event and must not jump on usage
+                // (the old `input_tokens.max(limit)` could even show a small
+                // window as permanently full).
                 self.usage = Usage {
                     input_tokens: *input_tokens,
                     output_tokens: *output_tokens,
                     total_tokens: *total_tokens,
                 };
-                if let Some(limit) = self.context_limit_tokens {
-                    self.context_used_tokens = (*input_tokens).max(limit);
-                } else {
-                    self.context_used_tokens = *input_tokens;
-                }
             }
             Event::Completed => {
+                self.context_overlay_tokens = 0;
                 self.finish_thinking("思考完成");
                 self.busy = false;
                 self.agent_phase = AgentPhase::Idle;
@@ -549,6 +560,7 @@ impl TuiSessionProjection {
             }
             Event::ChildSessionProgress { .. } => {}
             Event::Failed { error } => {
+                self.context_overlay_tokens = 0;
                 self.finish_thinking("思考失败");
                 self.mark_partial_if_streaming();
                 self.push_entry(DisplayEntry {
@@ -593,9 +605,13 @@ impl TuiSessionProjection {
                 outcome.transcript_dirty = true;
             }
             Event::ContextUpdated { budget } => {
+                // The authoritative anchor: replace the core budget and drop
+                // any local streaming overlay.
                 self.context_budget = Some(budget.clone());
                 self.context_limit_tokens = budget.context_window_tokens;
                 self.context_used_tokens = budget.used_tokens;
+                self.context_overlay_tokens = 0;
+                outcome.force_redraw = true;
             }
             Event::ResyncRequired => {
                 outcome.sessions_dirty = true;
@@ -604,6 +620,17 @@ impl TuiSessionProjection {
         }
         self.trim_entries();
         outcome
+    }
+
+    /// Adds a bounded coarse estimate of streamed bytes to the display-only
+    /// context overlay. The core remains the authority; this only keeps the
+    /// meter responsive between `ContextUpdated` anchors.
+    fn add_context_overlay(&mut self, delta: &str) {
+        let estimate = (delta.len() as u64).div_ceil(4).max(1);
+        self.context_overlay_tokens = self
+            .context_overlay_tokens
+            .saturating_add(estimate)
+            .min(1_000_000);
     }
 
     fn begin_thinking(&mut self) {
@@ -1038,6 +1065,7 @@ pub fn tool_display_name(name: &str) -> String {
         "file_delete" => Some("文件删除"),
         "web_search" => Some("网络搜索"),
         "web_fetch" | "webfetch" => Some("网页读取"),
+        "market_quote" => Some("实时行情"),
         "terminal_exec" => Some("命令执行"),
         "terminal_shell" => Some("Shell 命令"),
         "agent_spawn" => Some("子 Agent"),
@@ -1132,6 +1160,75 @@ mod tests {
     use super::*;
     use protium_core::conformance::Expectation;
     use protium_core::protocol::MessagePage;
+
+    #[test]
+    fn usage_never_mutates_the_authoritative_context_meter() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, Some(1000));
+        projection.handle_event(&Event::ContextUpdated {
+            budget: ContextBudgetDto {
+                context_window_tokens: Some(1000),
+                used_tokens: 120,
+                output_reserve_tokens: 100,
+                safe_input_tokens: Some(780),
+                window_source: "registry".into(),
+                estimated: true,
+            },
+        });
+        assert_eq!(projection.context_used_tokens, 120);
+        assert_eq!(projection.context_limit_tokens, Some(1000));
+
+        // Usage is display-only: the old code did `input_tokens.max(limit)`,
+        // which could render a small window as permanently full.
+        projection.handle_event(&Event::Usage {
+            input_tokens: 40,
+            output_tokens: 10,
+            total_tokens: 50,
+        });
+        assert_eq!(projection.context_used_tokens, 120);
+        assert_eq!(projection.usage.input_tokens, 40);
+
+        projection.handle_event(&Event::Usage {
+            input_tokens: 9000,
+            output_tokens: 10,
+            total_tokens: 9010,
+        });
+        assert_eq!(projection.context_used_tokens, 120);
+        assert_eq!(projection.usage.input_tokens, 9000);
+    }
+
+    #[test]
+    fn context_updated_is_the_authoritative_anchor_and_resets_overlay() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.handle_event(&Event::TextDelta {
+            delta: "x".repeat(400),
+        });
+        assert!(projection.context_overlay_tokens > 0);
+
+        projection.handle_event(&Event::ContextUpdated {
+            budget: ContextBudgetDto {
+                context_window_tokens: Some(2000),
+                used_tokens: 250,
+                output_reserve_tokens: 100,
+                safe_input_tokens: Some(1650),
+                window_source: "provider".into(),
+                estimated: true,
+            },
+        });
+        assert_eq!(projection.context_used_tokens, 250);
+        assert_eq!(projection.context_limit_tokens, Some(2000));
+        assert_eq!(projection.context_overlay_tokens, 0);
+        let budget = projection.context_budget.as_ref().expect("budget");
+        assert_eq!(budget.window_source, "provider");
+        assert!(budget.estimated);
+
+        // Terminal states also clear the overlay.
+        projection.handle_event(&Event::TextDelta {
+            delta: "y".repeat(400),
+        });
+        assert!(projection.context_overlay_tokens > 0);
+        projection.handle_event(&Event::Completed);
+        assert_eq!(projection.context_overlay_tokens, 0);
+    }
 
     /// Replays the core's shared conformance corpus through the projection:
     /// every scenario must replay without panicking and must land the

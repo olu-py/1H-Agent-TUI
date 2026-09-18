@@ -93,10 +93,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.settings_rect = app.settings.as_ref().map(|settings| match settings {
         SettingsState::List(_) => centered_rect(78, 20, area),
         SettingsState::Templates(_) => centered_rect(68, 18, area),
-        SettingsState::Form(_) => centered_rect(88, 22, area),
+        SettingsState::Form(_) => centered_rect(88, 24, area),
     });
     if let Some(settings) = &app.settings {
-        draw_settings(frame, area, settings, &theme);
+        draw_settings(frame, area, settings, app, &theme);
     }
     if let Some(palette) = &app.palette {
         draw_palette(frame, area, palette, &theme);
@@ -1618,6 +1618,7 @@ pub(crate) fn tool_display_name(name: &str) -> String {
         "file_delete" => Some("文件删除"),
         "web_search" => Some("网络搜索"),
         "web_fetch" | "webfetch" => Some("网页读取"),
+        "market_quote" => Some("实时行情"),
         "terminal_exec" => Some("命令执行"),
         "terminal_shell" => Some("Shell 命令"),
         "agent_spawn" => Some("子 Agent"),
@@ -1660,6 +1661,11 @@ fn tool_compact_summary(name: &str, arguments: &Value, width: usize) -> String {
             .collect::<Vec<_>>()
             .join("  "),
         "web_search" => get(&["query"]).to_owned(),
+        "market_quote" => [get(&["symbol"]), get(&["query"])]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("  "),
         "web_fetch" | "webfetch" | "browser_open" => get(&["url"]).to_owned(),
         "terminal_exec" => {
             let mut parts = Vec::new();
@@ -1892,8 +1898,21 @@ fn draw_provider_menu(
         .enumerate()
         .map(|(index, preset)| {
             let selected = index == app.provider_menu_selected;
+            let connected = app
+                .provider_settings
+                .as_ref()
+                .is_some_and(|settings| settings.connected.iter().any(|id| id == preset.key_id()));
+            let status = if connected {
+                "已连接"
+            } else {
+                "需要 API Key"
+            };
             ListItem::new(Line::from(Span::styled(
-                format!("{} {}", if selected { "›" } else { " " }, preset.label()),
+                format!(
+                    "{} {:<18} {status}",
+                    if selected { "›" } else { " " },
+                    preset.label()
+                ),
                 if selected {
                     theme.selected
                 } else {
@@ -1924,7 +1943,7 @@ fn draw_model_menu(
     let choices = crate::app::model_choices(app);
     let content_width = choices
         .iter()
-        .map(|model| UnicodeWidthStr::width(model.as_str()))
+        .map(|choice| UnicodeWidthStr::width(choice.label.as_str()))
         .max()
         .unwrap_or(12)
         .saturating_add(4) as u16;
@@ -1950,10 +1969,10 @@ fn draw_model_menu(
         .enumerate()
         .skip(scroll)
         .take(visible)
-        .map(|(index, model)| {
+        .map(|(index, choice)| {
             let selected = index == app.model_menu_selected;
             ListItem::new(Line::from(Span::styled(
-                format!("{} {}", if selected { "›" } else { " " }, model),
+                format!("{} {}", if selected { "›" } else { " " }, choice.label),
                 if selected {
                     theme.selected
                 } else {
@@ -1962,11 +1981,18 @@ fn draw_model_menu(
             )))
         })
         .collect::<Vec<_>>();
+    let status = if app.provider_models.loading {
+        " · 刷新中…"
+    } else if app.provider_models.last_error.is_some() {
+        " · 刷新失败"
+    } else {
+        ""
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title(format!(" {} 模型 ", app.provider_label()))
+                .title(format!(" {} 模型 · r 刷新{status} ", app.provider_label()))
                 .borders(Borders::ALL)
                 .border_style(theme.focus_border),
         ),
@@ -2216,6 +2242,10 @@ fn approval_lines(call: &crate::provider::ToolCall, reason: &str) -> Vec<Line<'s
 
 fn tool_risk(name: &str) -> &'static str {
     match name {
+        // Read-only network lookup; no workspace or external side effect.
+        "market_quote" | "web_search" | "web_fetch" | "webfetch" | "git_diff" => {
+            "LOW - read-only lookup"
+        }
         "file_delete" => "HIGH - removes workspace data",
         "terminal_shell" | "terminal_exec" | "git" => "HIGH - can change workspace state",
         "file_write" | "file_edit" | "file_move" | "file_copy" | "file_mkdir" => {
@@ -2275,6 +2305,8 @@ fn session_allow_preview(call: &crate::provider::ToolCall) -> Option<String> {
 fn argument_label(key: &str) -> &'static str {
     match key {
         "path" => "路径",
+        "symbol" => "代码",
+        "query" => "查询",
         "old_string" => "原文本",
         "new_string" => "新文本",
         "source" | "from" => "来源",
@@ -2348,11 +2380,35 @@ fn format_bytes(bytes: u64) -> String {
 enum SettingsRow {
     Section(&'static str),
     Field(SettingsField),
+    /// TUI-only context-window override; the core DTO does not carry it, so it
+    /// is edited through the same form and passed to `set_provider_profile`.
+    ContextWindow,
     Spacer,
 }
 
+/// TUI row index of the synthetic context-window override. Rendered right
+/// after Thinking, so it takes Thinking's following slot and ApiKey shifts by
+/// one.
+fn context_window_row() -> usize {
+    FIELDS.len().saturating_sub(1)
+}
+
+/// TUI row index for a core field. ApiKey follows the synthetic row, so it is
+/// shifted by one.
+fn tui_field_row(field: SettingsField) -> usize {
+    let index = FIELDS
+        .iter()
+        .position(|spec| spec.field == field)
+        .unwrap_or(0);
+    if index >= FIELDS.len().saturating_sub(1) {
+        index + 1
+    } else {
+        index
+    }
+}
+
 fn settings_rows() -> Vec<SettingsRow> {
-    let mut rows = Vec::with_capacity(FIELDS.len() * 2 + 3);
+    let mut rows = Vec::with_capacity(FIELDS.len() * 2 + 4);
     let mut last_section = None;
     for spec in FIELDS {
         if last_section != Some(spec.section) {
@@ -2361,6 +2417,11 @@ fn settings_rows() -> Vec<SettingsRow> {
             rows.push(SettingsRow::Spacer);
         }
         rows.push(SettingsRow::Field(spec.field));
+        if spec.field == SettingsField::Thinking {
+            // The override sits with the other advanced knobs, immediately
+            // after Thinking and before the write-only API key.
+            rows.push(SettingsRow::ContextWindow);
+        }
         rows.push(SettingsRow::Spacer);
     }
     rows
@@ -2368,13 +2429,19 @@ fn settings_rows() -> Vec<SettingsRow> {
 
 const SETTINGS_LABEL_COLUMNS: usize = 12;
 
-fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState, theme: &UiTheme) {
+fn draw_settings(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    settings: &SettingsState,
+    app: &App,
+    theme: &UiTheme,
+) {
     match settings {
         SettingsState::List(list) => draw_provider_list(frame, area, list, theme),
         SettingsState::Templates(templates) => {
             draw_provider_templates(frame, area, templates, theme)
         }
-        SettingsState::Form(form) => draw_provider_form(frame, area, form, theme),
+        SettingsState::Form(form) => draw_provider_form(frame, area, form, app, theme),
     }
 }
 
@@ -2402,7 +2469,7 @@ fn draw_provider_list(
         let status = if list.connected.contains(&provider.preset) {
             "已连接"
         } else {
-            "密钥未解锁"
+            "需要 API Key"
         };
         lines.push(Line::from(Span::styled(
             format!(
@@ -2497,18 +2564,34 @@ fn draw_provider_templates(
     );
 }
 
-fn draw_provider_form(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, theme: &UiTheme) {
-    let popup = centered_rect(88, 22, area);
+fn draw_provider_form(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &SettingsForm,
+    app: &App,
+    theme: &UiTheme,
+) {
+    let popup = centered_rect(88, 24, area);
     let inner = Block::bordered().inner(popup);
     let footer_rows = 2usize;
     let visible = (inner.height as usize).saturating_sub(footer_rows);
 
     let rows = settings_rows();
-    let selected_field = form.field();
-    let selected_row = rows
-        .iter()
-        .position(|row| matches!(row, SettingsRow::Field(field) if *field == selected_field))
-        .unwrap_or(0);
+    let selected_row = if app.settings_field_index == context_window_row() {
+        rows.iter()
+            .position(|row| matches!(row, SettingsRow::ContextWindow))
+            .unwrap_or(0)
+    } else {
+        rows.iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    SettingsRow::Field(field)
+                        if tui_field_row(*field) == app.settings_field_index
+                )
+            })
+            .unwrap_or(0)
+    };
     let scroll = selected_row
         .saturating_sub(visible.saturating_sub(1))
         .min(rows.len().saturating_sub(visible));
@@ -2529,9 +2612,38 @@ fn draw_provider_form(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, th
                     theme.strong(VisualRole::Accent),
                 )));
             }
+            SettingsRow::ContextWindow => {
+                let selected = app.settings_field_index == context_window_row();
+                let marker = if selected { "›" } else { " " };
+                let label = "上下文窗口";
+                let label_pad = " "
+                    .repeat(SETTINGS_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(label)));
+                let value = if app.context_window_input.trim().is_empty() {
+                    "（继承）".to_owned()
+                } else {
+                    app.context_window_input.clone()
+                };
+                let label_style = if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Primary)
+                };
+                let value_style = if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Secondary)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {marker} {label}{label_pad}"), label_style),
+                    Span::styled(
+                        format!("  {}", fit_text(value.as_str(), value_width)),
+                        value_style,
+                    ),
+                ]));
+            }
             SettingsRow::Field(field) => {
                 let spec = FIELDS.iter().find(|spec| spec.field == *field).unwrap();
-                let selected = *field == selected_field;
+                let selected = app.settings_field_index == tui_field_row(*field);
                 let marker = if selected { "›" } else { " " };
                 let label_pad = " ".repeat(
                     SETTINGS_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(spec.label)),
@@ -3092,7 +3204,7 @@ mod tests {
             .iter()
             .filter_map(|row| match row {
                 SettingsRow::Section(section) => Some(*section),
-                SettingsRow::Field(_) | SettingsRow::Spacer => None,
+                SettingsRow::Field(_) | SettingsRow::ContextWindow | SettingsRow::Spacer => None,
             })
             .collect();
         assert_eq!(sections, vec!["基础", "连接", "高级"]);
@@ -3100,7 +3212,7 @@ mod tests {
         let fields: Vec<SettingsField> = rows
             .iter()
             .filter_map(|row| match row {
-                SettingsRow::Section(_) | SettingsRow::Spacer => None,
+                SettingsRow::Section(_) | SettingsRow::ContextWindow | SettingsRow::Spacer => None,
                 SettingsRow::Field(field) => Some(*field),
             })
             .collect();
@@ -3478,6 +3590,7 @@ mod tests {
             ("file_delete", "文件删除"),
             ("web_search", "网络搜索"),
             ("web_fetch", "网页读取"),
+            ("market_quote", "实时行情"),
             ("terminal_exec", "命令执行"),
             ("terminal_shell", "Shell 命令"),
             ("agent_spawn", "子 Agent"),

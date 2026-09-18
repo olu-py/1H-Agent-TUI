@@ -25,14 +25,17 @@ use protium_core::{
     agent::ChildSessionProgress,
     commands::{self, AgentMode, Command, TodoCommand},
     config::{
-        Config, ProviderPreset, ThinkingLevel, ThinkingProfile, ThinkingProfileKind,
+        Config, ProviderKind, ProviderPreset, ThinkingLevel, ThinkingProfile, ThinkingProfileKind,
         thinking_profile,
     },
-    protocol::{AppSnapshotV2, ApprovalDto, Envelope, Event as ProtocolEvent},
+    protocol::{
+        AppSnapshotV2, ApprovalDto, Envelope, Event as ProtocolEvent, ProviderModelDto,
+        ProviderModelsDto, ProviderProfileDto, ProviderSettingsDto,
+    },
     secrets,
     security::Workspace,
     service::{AppHandle, AppService, CoreConfig},
-    settings::{SettingsField, SettingsForm, SettingsState},
+    settings::{FIELDS, SettingsField, SettingsForm, SettingsState},
     storage::SessionSummary,
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
@@ -91,6 +94,33 @@ impl EventOutcome {
     }
 }
 
+/// TUI cache of the core's dynamic provider model list. The core remains the
+/// source of truth; this only mirrors the last `provider_models` answer for the
+/// active preset so menus can render without another round trip.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderModelsState {
+    pub preset: Option<ProviderPreset>,
+    pub models: Vec<ProviderModelDto>,
+    pub fetched_at: Option<i64>,
+    pub loading: bool,
+    pub last_error: Option<String>,
+}
+
+/// Result of a background `provider_models(true)` refresh.
+#[derive(Debug)]
+pub(crate) struct ModelRefreshResult {
+    pub preset: ProviderPreset,
+    pub result: std::result::Result<ProviderModelsDto, String>,
+}
+
+/// One model picker entry: the stable id plus its display label. Deduping and
+/// selection always key off `id`, never the decorated label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelChoice {
+    pub id: String,
+    pub label: String,
+}
+
 /// TUI facade. Owns the terminal shell, the display projection of the active
 /// session, and every TUI-only interaction state (menus, scroll, layout,
 /// mouse). All mutation is delegated to [`AppHandle`]; this struct never
@@ -102,6 +132,22 @@ pub struct App {
     /// Shared configuration for display and the settings page. The core owns
     /// the authoritative copy; every mutation goes through the handle.
     pub config: Config,
+    /// Core-authoritative provider settings view: active profile, saved
+    /// profiles and the presets with a currently resolvable API key.
+    pub provider_settings: Option<ProviderSettingsDto>,
+    /// Last `provider_models(false)` answer for the active preset.
+    pub provider_models: ProviderModelsState,
+    /// Background model-refresh result channel (sender side).
+    pub(crate) model_refresh_tx: tokio::sync::mpsc::UnboundedSender<ModelRefreshResult>,
+    /// Background model-refresh result channel (receiver side; taken by the
+    /// event loop so its `select!` branch never borrows the whole facade).
+    pub(crate) model_refresh_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ModelRefreshResult>>,
+    /// TUI-only settings selection: the core `FIELDS` rows followed by the
+    /// synthetic context-window override row.
+    pub settings_field_index: usize,
+    /// Write-only context-window override buffer. Empty means "inherit the
+    /// merged profile value"; digits are passed to the core, which clamps.
+    pub context_window_input: String,
     pub input: InputBuffer,
     pub context_meter_enabled: bool,
     pub settings: Option<SettingsState>,
@@ -342,7 +388,12 @@ async fn build_app(
 ) -> Result<App> {
     let active_session = snapshot.active_session.clone().unwrap_or_default();
     let mode = AgentMode::parse(&snapshot.mode).unwrap_or_default();
-    let context_limit_tokens = config.provider.resolved_context_window_tokens();
+    // Context capacity is core-authoritative: seed from the snapshot budget,
+    // never from local config inference.
+    let context_limit_tokens = snapshot
+        .context
+        .as_ref()
+        .and_then(|context| context.context_window_tokens);
     let mut current = TuiSessionProjection::new(active_session.clone(), mode, context_limit_tokens);
     if let Some(session) = snapshot
         .sessions
@@ -359,13 +410,21 @@ async fn build_app(
     }
     let sessions = snapshot.sessions.iter().map(session_summary).collect();
     let workspace_security = Workspace::new(&workspace)?;
+    let context_meter_enabled = config.ui.context_meter;
+    let (model_refresh_tx, model_refresh_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App {
         handle,
         workspace,
         workspace_security,
         config,
+        provider_settings: None,
+        provider_models: ProviderModelsState::default(),
+        model_refresh_tx,
+        model_refresh_rx: Some(model_refresh_rx),
+        settings_field_index: 0,
+        context_window_input: String::new(),
         input: InputBuffer::new(),
-        context_meter_enabled: false,
+        context_meter_enabled,
         settings: None,
         settings_rect: None,
         palette: None,
@@ -404,6 +463,10 @@ async fn build_app(
         history_load_pending: false,
     };
     app.sync_from_snapshot(&snapshot);
+    // Seed the core-authoritative provider surfaces before the first draw.
+    // Both calls are cache-only and never block on the network.
+    let _ = refresh_provider_settings(&mut app).await;
+    let _ = load_provider_models(&mut app, false).await;
     app.load_history().await?;
     Ok(app)
 }
@@ -453,6 +516,10 @@ async fn event_loop(
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut live = subscribe_live(app).await?;
+    let mut model_refresh_rx = app
+        .model_refresh_rx
+        .take()
+        .context("model refresh receiver already taken")?;
     let mut edge_scroll_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut thinking_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut deferred_redraw_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
@@ -509,6 +576,12 @@ async fn event_loop(
         };
         let mut redraw = false;
         tokio::select! {
+            refresh = model_refresh_rx.recv() => {
+                if let Some(refresh) = refresh {
+                    apply_model_refresh_result(app, refresh);
+                    redraw = true;
+                }
+            }
             _ = deferred_redraw_tick => {
                 deferred_redraw_timer = None;
                 redraw = true;
@@ -815,7 +888,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         KeyCode::Char('s')
             if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
         {
-            open_settings(app);
+            open_settings(app).await;
             true
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1036,37 +1109,209 @@ async fn handle_thinking_mouse(
     Ok(None)
 }
 
-pub(crate) fn model_choices(app: &App) -> Vec<String> {
-    let mut choices = app
-        .config
-        .provider
-        .preset
-        .selectable_models()
+/// Model picker entries for the active provider.
+///
+/// Merge order follows the parity plan: core dynamic list, preset static
+/// fallback, current model, then models saved on other profiles of the same
+/// preset. Deduping keys off the model id; the decorated label is display-only.
+pub(crate) fn model_choices(app: &App) -> Vec<ModelChoice> {
+    let preset = app.active_preset();
+    let mut choices: Vec<ModelChoice> = Vec::new();
+    let mut push = |id: String, window: Option<u64>| {
+        let id = id.trim().to_owned();
+        if id.is_empty() || choices.iter().any(|choice| choice.id == id) {
+            return;
+        }
+        choices.push(ModelChoice {
+            label: model_choice_label(&id, window),
+            id,
+        });
+    };
+    if app.provider_models.preset == Some(preset) {
+        for model in &app.provider_models.models {
+            push(model.id.clone(), model.context_window_tokens);
+        }
+    }
+    for model in preset.selectable_models() {
+        push((*model).to_owned(), None);
+    }
+    let current = app.active_model().to_owned();
+    let current_window = app
+        .provider_models
+        .models
         .iter()
-        .map(|model| (*model).to_owned())
-        .collect::<Vec<_>>();
-    if choices.is_empty() {
-        choices.push(app.config.provider.model.clone());
-    } else if !choices
-        .iter()
-        .any(|model| model == &app.config.provider.model)
-    {
-        choices.insert(0, app.config.provider.model.clone());
+        .find(|model| model.id == current)
+        .and_then(|model| model.context_window_tokens);
+    push(current, current_window);
+    if let Some(settings) = &app.provider_settings {
+        for profile in &settings.saved {
+            if profile.preset == preset.key_id() {
+                push(profile.model.clone(), None);
+            }
+        }
     }
     choices
 }
 
+/// Formats a model picker label with a short context-window suffix.
+fn model_choice_label(id: &str, window: Option<u64>) -> String {
+    match window {
+        Some(window) if window > 0 => format!("{id} · {}", compact_window(window)),
+        _ => id.to_owned(),
+    }
+}
+
+fn compact_window(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+        format!("{}m", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
+        format!("{}k", tokens / 1_000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Provider switcher entries, derived from the core-authoritative settings
+/// view when available: registry order, then connected/saved/active presets.
+/// The local config is only a startup fallback before the first core read.
 pub(crate) fn provider_choices(app: &App) -> Vec<ProviderPreset> {
-    let mut choices = app
-        .config
-        .providers
-        .iter()
-        .map(|provider| provider.preset)
-        .collect::<Vec<_>>();
-    if !choices.contains(&app.config.provider.preset) {
-        choices.insert(0, app.config.provider.preset);
+    let mut choices: Vec<ProviderPreset> = Vec::new();
+    let mut push = |preset: ProviderPreset| {
+        if !choices.contains(&preset) {
+            choices.push(preset);
+        }
+    };
+    if let Some(settings) = &app.provider_settings {
+        for preset in ProviderPreset::ALL {
+            let connected = settings.connected.iter().any(|id| id == preset.key_id());
+            let saved = settings
+                .saved
+                .iter()
+                .any(|profile| profile.preset == preset.key_id());
+            let active = settings.active.preset == preset.key_id();
+            if connected || saved || active {
+                push(preset);
+            }
+        }
+    } else {
+        for provider in &app.config.providers {
+            push(provider.preset);
+        }
+    }
+    let active = app.active_preset();
+    if !choices.contains(&active) {
+        choices.insert(0, active);
     }
     choices
+}
+
+/// Reads the core provider settings view (cache-only, never a network call).
+async fn refresh_provider_settings(app: &mut App) -> Result<()> {
+    match app.handle.provider_settings().await {
+        Ok(settings) => {
+            app.provider_settings = Some(settings);
+            sync_local_config_from_provider_settings(app);
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!(secrets::redact(&error.message))),
+    }
+}
+
+/// Mirrors the core's active provider profile onto the local display config so
+/// the settings form and footer seed from the same authority. The DTO omits
+/// thinking/retry fields, so those local values are preserved.
+fn sync_local_config_from_provider_settings(app: &mut App) {
+    let Some((preset, model, base_url, kind)) = app.provider_settings.as_ref().map(|settings| {
+        (
+            ProviderPreset::parse(&settings.active.preset),
+            settings.active.model.clone(),
+            settings.active.base_url.clone(),
+            ProviderKind::parse_wire_tag(&settings.active.kind),
+        )
+    }) else {
+        return;
+    };
+    if let Some(preset) = preset {
+        app.config.provider.preset = preset;
+    }
+    app.config.provider.model = model;
+    if !base_url.trim().is_empty() {
+        app.config.provider.base_url = base_url;
+    }
+    if let Some(kind) = kind {
+        app.config.provider.kind = kind;
+    }
+}
+
+/// Reads the provider model list. `refresh = false` is cache-only and safe to
+/// await inline; `refresh = true` must go through [`spawn_model_refresh`].
+async fn load_provider_models(app: &mut App, refresh: bool) -> Result<()> {
+    let preset = app.active_preset();
+    let result = app.handle.provider_models(refresh).await;
+    match result {
+        Ok(models) => {
+            app.provider_models = ProviderModelsState {
+                preset: Some(preset),
+                models: models.models,
+                fetched_at: models.fetched_at,
+                loading: false,
+                last_error: None,
+            };
+            Ok(())
+        }
+        Err(error) => {
+            let message = secrets::redact(&error.message);
+            app.provider_models.loading = false;
+            app.provider_models.last_error = Some(message.clone());
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
+/// Starts a background `provider_models(true)` refresh so the terminal event
+/// loop never blocks on the provider network round trip.
+fn spawn_model_refresh(app: &mut App) {
+    let preset = app.active_preset();
+    app.provider_models.loading = true;
+    app.provider_models.last_error = None;
+    app.current.status = "模型列表刷新中……".into();
+    let handle = app.handle.clone();
+    let sender = app.model_refresh_tx.clone();
+    tokio::spawn(async move {
+        let result = handle
+            .provider_models(true)
+            .await
+            .map_err(|error| secrets::redact(&error.message));
+        let _ = sender.send(ModelRefreshResult { preset, result });
+    });
+}
+
+fn apply_model_refresh_result(app: &mut App, refresh: ModelRefreshResult) {
+    // A provider switch may have landed while the refresh was in flight; a
+    // stale answer must never overwrite the new provider's model list.
+    if app.active_preset() != refresh.preset {
+        app.provider_models.loading = false;
+        return;
+    }
+    match refresh.result {
+        Ok(models) => {
+            app.provider_models = ProviderModelsState {
+                preset: Some(refresh.preset),
+                models: models.models,
+                fetched_at: models.fetched_at,
+                loading: false,
+                last_error: None,
+            };
+            app.current.status = "模型列表已刷新".into();
+        }
+        Err(error) => {
+            app.provider_models.loading = false;
+            app.provider_models.last_error = Some(error);
+            app.current.status = "模型刷新失败，已保留现有列表".into();
+        }
+    }
 }
 
 async fn handle_provider_mouse(
@@ -1097,6 +1342,7 @@ async fn handle_provider_mouse(
         app.model_menu_open = false;
         app.model_menu_rect = None;
         app.provider_menu_open = true;
+        let _ = refresh_provider_settings(app).await;
         return Ok(Some(EventOutcome::redraw()));
     }
     Ok(None)
@@ -1174,6 +1420,7 @@ async fn handle_model_mouse(
         app.provider_menu_open = false;
         app.provider_menu_rect = None;
         app.model_menu_open = true;
+        let _ = load_provider_models(app, false).await;
         return Ok(Some(EventOutcome::redraw()));
     }
     Ok(None)
@@ -1185,17 +1432,23 @@ fn model_menu_selection(app: &App, rect: Rect, column: u16, row: u16) -> Option<
         return None;
     }
     let index = row.saturating_sub(inner.y) as usize;
-    model_choices(app).get(index).cloned()
+    model_choices(app)
+        .get(index)
+        .map(|choice| choice.id.clone())
 }
 
 fn model_menu_key_handled(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::Enter
+        KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Char('r')
     )
 }
 
 async fn handle_model_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
+    if code == KeyCode::Char('r') {
+        spawn_model_refresh(app);
+        return Ok(());
+    }
     let choices = model_choices(app);
     if choices.is_empty() {
         return Ok(());
@@ -1212,7 +1465,7 @@ async fn handle_model_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
             app.model_menu_selected = (app.model_menu_selected + 1) % choices.len();
         }
         KeyCode::Enter => {
-            let model = choices[app.model_menu_selected].clone();
+            let model = choices[app.model_menu_selected].id.clone();
             app.apply_model_choice(model).await?;
             app.model_menu_open = false;
             app.model_menu_rect = None;
@@ -1271,8 +1524,8 @@ async fn apply_thinking_selection(
     provider.normalize_thinking();
     app.handle.set_provider_config(provider.clone()).await?;
     app.config.provider = provider;
-    app.current.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
     app.current.status = format!("思考强度已设为 {}", level.label());
+    let _ = refresh_provider_settings(app).await;
     app.sync_all().await?;
     Ok(())
 }
@@ -1654,12 +1907,30 @@ fn edge_scroll_direction(row: u16, viewport: ratatui::layout::Rect) -> i8 {
 }
 
 impl App {
+    /// Core-authoritative active preset, falling back to the local config
+    /// snapshot before the first `provider_settings()` read.
+    pub(crate) fn active_preset(&self) -> ProviderPreset {
+        self.provider_settings
+            .as_ref()
+            .and_then(|settings| ProviderPreset::parse(&settings.active.preset))
+            .unwrap_or(self.config.provider.preset)
+    }
+
+    /// Core-authoritative active model id.
+    pub(crate) fn active_model(&self) -> &str {
+        self.provider_settings
+            .as_ref()
+            .map(|settings| settings.active.model.as_str())
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&self.config.provider.model)
+    }
+
     pub(crate) fn provider_label(&self) -> &'static str {
-        self.config.provider.preset.label()
+        self.active_preset().label()
     }
 
     pub(crate) fn model_name(&self) -> &str {
-        &self.config.provider.model
+        self.active_model()
     }
 
     pub(crate) fn thinking_level(&self) -> ThinkingLevel {
@@ -1853,31 +2124,50 @@ impl App {
     }
 
     async fn apply_provider_choice(&mut self, preset: ProviderPreset) -> Result<()> {
-        if preset == self.config.provider.preset {
+        if preset == self.active_preset() {
             return Ok(());
         }
-        if let Err(error) = self
-            .handle
-            .set_provider(preset.key_id(), &self.config.provider.model)
-            .await
-        {
+        // Prefer the target preset's saved model; otherwise use its template
+        // default. Carrying the old provider's model across would pair an
+        // unrelated model id with the new provider.
+        let model = self
+            .provider_settings
+            .as_ref()
+            .and_then(|settings| {
+                settings
+                    .saved
+                    .iter()
+                    .find(|profile| profile.preset == preset.key_id())
+                    .map(|profile| profile.model.clone())
+            })
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| preset.defaults().model);
+        if let Err(error) = self.handle.set_provider(preset.key_id(), &model).await {
             self.current.status = secrets::redact(&error.message);
             return Ok(());
         }
+        // The active preset changed: drop the previous provider's dynamic model
+        // cache before reading the new one.
+        self.provider_models = ProviderModelsState::default();
         self.sync_all().await?;
+        let _ = refresh_provider_settings(self).await;
+        let _ = load_provider_models(self, false).await;
         Ok(())
     }
 
     async fn apply_model_choice(&mut self, model: String) -> Result<()> {
-        if model.trim().is_empty() {
+        let model = model.trim().to_owned();
+        if model.is_empty() {
             return Ok(());
         }
-        let preset = self.config.provider.preset;
+        let preset = self.active_preset();
         if let Err(error) = self.handle.set_provider(preset.key_id(), &model).await {
             self.current.status = secrets::redact(&error.message);
             return Ok(());
         }
         self.sync_all().await?;
+        let _ = refresh_provider_settings(self).await;
+        let _ = load_provider_models(self, false).await;
         Ok(())
     }
 }
@@ -1996,7 +2286,10 @@ impl App {
                 self.current = TuiSessionProjection::new(
                     session_id.clone(),
                     AgentMode::parse(&snapshot.mode).unwrap_or_default(),
-                    self.config.provider.resolved_context_window_tokens(),
+                    snapshot
+                        .context
+                        .as_ref()
+                        .and_then(|context| context.context_window_tokens),
                 );
             }
             self.active_session = session_id.clone();
@@ -2018,11 +2311,18 @@ impl App {
             }
         }
         self.current.mode = AgentMode::parse(&snapshot.mode).unwrap_or(self.current.mode);
-        if let Some(context) = &snapshot.context {
-            self.current.context_budget = Some(context.clone());
-            self.current.context_limit_tokens = context.context_window_tokens;
-            self.current.context_used_tokens = context.used_tokens;
-        }
+        // The snapshot budget is authoritative; clear stale local context
+        // state when the core reports no budget for this session.
+        self.current.context_budget = snapshot.context.clone();
+        self.current.context_limit_tokens = snapshot
+            .context
+            .as_ref()
+            .and_then(|context| context.context_window_tokens);
+        self.current.context_used_tokens = snapshot
+            .context
+            .as_ref()
+            .map_or(0, |context| context.used_tokens);
+        self.current.context_overlay_tokens = 0;
         // Render a persisted incomplete answer (surviving a restart) once, and
         // drop it once the core clears the partial (normal completion).
         self.current
@@ -2047,6 +2347,13 @@ impl App {
                 .iter()
                 .all(|task| task.status == TodoStatus::Done);
         self.config.provider.model = snapshot.model.clone();
+        if let Some(preset) = ProviderPreset::ALL
+            .iter()
+            .copied()
+            .find(|preset| preset.label() == snapshot.provider)
+        {
+            self.config.provider.preset = preset;
+        }
         if let Some(provider) = self
             .config
             .providers
@@ -2055,6 +2362,16 @@ impl App {
         {
             provider.model = snapshot.model.clone();
             self.config.provider = provider.clone();
+        }
+        if let Some(settings) = &mut self.provider_settings {
+            settings.active.model = snapshot.model.clone();
+            if let Some(preset) = ProviderPreset::ALL
+                .iter()
+                .copied()
+                .find(|preset| preset.label() == snapshot.provider)
+            {
+                settings.active.preset = preset.key_id().to_owned();
+            }
         }
     }
 
@@ -2125,7 +2442,7 @@ impl App {
                 self.current.push_entry(DisplayEntry {
                     kind: DisplayKind::System,
                     content: DisplayContent::Markdown(
-                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
+                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/uncompact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/diff`\n`/plan` `/build` `/explore` `/cluster` `/model` `/provider` `/agent`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell\n\n搜索后端（DuckDuckGo/Bing）来自 config 的 [runtime].search_backend，TUI 不另存配置"
                             .into(),
                     ),
                 });
@@ -2133,7 +2450,7 @@ impl App {
                 Ok(())
             }
             Command::Provider => {
-                open_settings(self);
+                open_settings(self).await;
                 Ok(())
             }
             Command::Clear => {
@@ -2298,25 +2615,96 @@ fn apply_file_completion(app: &mut App) {
     app.file_suggestions.clear();
 }
 
-fn open_settings(app: &mut App) {
-    let _ = reload_config(app);
-    app.settings = Some(SettingsState::list(
-        app.config.providers.clone(),
-        app.config.provider.preset,
-    ));
+async fn open_settings(app: &mut App) {
+    // Provider settings are core-authoritative; the local config is only a
+    // fallback until the first read lands.
+    let _ = refresh_provider_settings(app).await;
+    app.settings = Some(provider_list_state(app));
+    app.settings_field_index = 0;
+    app.context_window_input.clear();
+    let _ = load_provider_models(app, false).await;
     app.current.status = "已连接的供应商".into();
 }
 
-/// Reloads the shared config from disk into the facade. The core owns the
-/// authoritative copy; this keeps the read-only display surface fresh.
-fn reload_config(app: &mut App) -> Result<()> {
-    let updated = Config::load(None, &app.workspace)?;
-    app.config = updated;
-    app.context_meter_enabled = app.config.ui.context_meter;
-    Ok(())
+/// Converts the core settings DTO back into the display/edit shape the
+/// existing settings UI consumes. Secrets never cross this boundary.
+fn provider_configs_from_settings(app: &App) -> Vec<crate::config::ProviderConfig> {
+    let Some(settings) = &app.provider_settings else {
+        return app.config.providers.clone();
+    };
+    let mut providers = settings
+        .saved
+        .iter()
+        .map(|profile| provider_config_from_profile(app, profile))
+        .collect::<Vec<_>>();
+    // The active profile is always editable even when it has never been
+    // explicitly saved (for example the built-in default provider).
+    if !providers
+        .iter()
+        .any(|provider| provider.preset.key_id() == settings.active.preset)
+        && let Some(active) = provider_config_from_active(app, settings)
+    {
+        providers.insert(0, active);
+    }
+    providers
 }
 
-fn available_key_presets() -> HashSet<ProviderPreset> {
+fn provider_config_from_active(
+    app: &App,
+    settings: &ProviderSettingsDto,
+) -> Option<crate::config::ProviderConfig> {
+    let preset = ProviderPreset::parse(&settings.active.preset)?;
+    let mut config = if preset == app.config.provider.preset {
+        app.config.provider.clone()
+    } else {
+        preset.defaults()
+    };
+    config.preset = preset;
+    config.model = settings.active.model.clone();
+    if !settings.active.base_url.trim().is_empty() {
+        config.base_url = settings.active.base_url.clone();
+    }
+    if let Some(kind) = ProviderKind::parse_wire_tag(&settings.active.kind) {
+        config.kind = kind;
+    }
+    Some(config)
+}
+
+fn provider_config_from_profile(
+    app: &App,
+    profile: &ProviderProfileDto,
+) -> crate::config::ProviderConfig {
+    let preset = ProviderPreset::parse(&profile.preset).unwrap_or_default();
+    // The DTO intentionally omits thinking/retry fields. For the preset the
+    // local config still tracks, start from that richer copy so editing the
+    // active provider does not silently reset those customizations; the core
+    // merge keeps them on apply anyway.
+    let mut config = if preset == app.config.provider.preset {
+        app.config.provider.clone()
+    } else {
+        preset.defaults()
+    };
+    config.preset = preset;
+    config.model = profile.model.clone();
+    if !profile.base_url.trim().is_empty() {
+        config.base_url = profile.base_url.clone();
+    }
+    if let Some(kind) = ProviderKind::parse_wire_tag(&profile.kind) {
+        config.kind = kind;
+    }
+    config
+}
+
+/// Connected presets from the core settings view. Falls back to the local
+/// secret cache only before the first core read (e.g. during tests).
+fn available_key_presets(app: &App) -> HashSet<ProviderPreset> {
+    if let Some(settings) = &app.provider_settings {
+        return settings
+            .connected
+            .iter()
+            .filter_map(|preset| ProviderPreset::parse(preset))
+            .collect();
+    }
     ProviderPreset::ALL
         .iter()
         .filter_map(|preset| secrets::api_key_cached_only(*preset).ok().map(|_| *preset))
@@ -2324,22 +2712,44 @@ fn available_key_presets() -> HashSet<ProviderPreset> {
 }
 
 fn provider_form(app: &App, provider: crate::config::ProviderConfig) -> SettingsForm {
-    let existing_key_preset = secrets::api_key_cached_only(app.config.provider.preset)
-        .ok()
-        .map(|_| app.config.provider.preset);
+    let preset = provider.preset;
+    let available = available_key_presets(app);
+    let existing_key_preset = available.contains(&preset).then_some(preset);
     let mut form = SettingsForm::new(provider, existing_key_preset);
-    form.set_available_key_presets(available_key_presets());
+    form.set_available_key_presets(available);
     form
 }
 
+/// Builds the settings list with `connected` sourced from the core DTO (the
+/// local `SettingsState::list` constructor would re-derive it from the cache).
+fn provider_list_state(app: &App) -> SettingsState {
+    let providers = provider_configs_from_settings(app);
+    let mut state = SettingsState::list(providers, app.active_preset());
+    if let SettingsState::List(list) = &mut state
+        && let Some(settings) = &app.provider_settings
+    {
+        list.connected = settings
+            .connected
+            .iter()
+            .filter_map(|preset| ProviderPreset::parse(preset))
+            .collect();
+    }
+    state
+}
+
 fn reopen_provider_list(app: &mut App) {
-    app.settings = Some(SettingsState::list(
-        app.config.providers.clone(),
-        app.config.provider.preset,
-    ));
+    app.settings = Some(provider_list_state(app));
+    app.settings_field_index = 0;
+    app.context_window_input.clear();
 }
 
 fn open_provider_form(app: &mut App, provider: crate::config::ProviderConfig) {
+    // The core profile DTO intentionally omits the explicit context window, so
+    // the safe default is "inherit the merged profile value". Typing a number
+    // sends an override the core clamps; leaving it empty keeps whatever the
+    // core already has (including edits made by WebUI).
+    app.context_window_input.clear();
+    app.settings_field_index = 0;
     app.settings = Some(SettingsState::Form(provider_form(app, provider)));
 }
 
@@ -2356,7 +2766,6 @@ fn open_selected_profile(app: &mut App) {
         .as_ref()
         .and_then(SettingsState::selected_profile)
     {
-        let _ = secrets::api_key_cached(provider.preset);
         open_provider_form(app, provider);
         app.current.status = "编辑供应商".into();
     }
@@ -2371,6 +2780,19 @@ fn open_selected_template(app: &mut App) {
         open_provider_form(app, preset.defaults());
         app.current.status = format!("添加 {}", preset.label());
     }
+}
+
+/// Total selectable rows in the settings form: the core `FIELDS` registry plus
+/// one TUI-only synthetic context-window override row.
+fn settings_row_count() -> usize {
+    FIELDS.len() + 1
+}
+
+/// TUI row index of the synthetic context-window override. It is rendered
+/// immediately after Thinking and before the write-only API key, so it sits at
+/// the last core field index rather than at the end of the row list.
+fn context_window_row() -> usize {
+    FIELDS.len().saturating_sub(1)
 }
 
 fn settings_key_handled(code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -2402,6 +2824,17 @@ fn palette_key_handled(code: KeyCode, modifiers: KeyModifiers) -> bool {
 }
 
 fn paste_text_into_settings(app: &mut App, text: &str) -> bool {
+    if app.settings_field_index == context_window_row() {
+        let sanitized = text.replace(['\r', '\n'], "");
+        if sanitized
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        {
+            app.context_window_input = sanitized;
+            return true;
+        }
+        return false;
+    }
     let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) else {
         return false;
     };
@@ -2437,24 +2870,44 @@ async fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifie
             }
         }
         KeyCode::Tab | KeyCode::Down => {
-            if let Some(settings) = &mut app.settings {
+            if app
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.form().is_some())
+            {
+                app.settings_field_index = (app.settings_field_index + 1) % settings_row_count();
+                sync_form_selection(app);
+            } else if let Some(settings) = &mut app.settings {
                 settings.move_selection(1);
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
-            if let Some(settings) = &mut app.settings {
+            if app
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.form().is_some())
+            {
+                app.settings_field_index =
+                    (app.settings_field_index + settings_row_count() - 1) % settings_row_count();
+                sync_form_selection(app);
+            } else if let Some(settings) = &mut app.settings {
                 settings.move_selection(-1);
             }
         }
         KeyCode::Left | KeyCode::Right => {
             let direction = if code == KeyCode::Right { 1 } else { -1 };
+            if app.settings_field_index == context_window_row() {
+                return;
+            }
             if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
                 let field = form.field();
                 form.cycle(field, direction);
             }
         }
         KeyCode::Backspace => {
-            if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
+            if app.settings_field_index == context_window_row() {
+                app.context_window_input.pop();
+            } else if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
                 let field = form.field();
                 form.edit(field, None);
             }
@@ -2480,12 +2933,20 @@ async fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifie
             if matches!(app.settings, Some(SettingsState::Form(_)))
                 && (code == KeyCode::Delete || modifiers.contains(KeyModifiers::CONTROL)) =>
         {
-            if let Err(error) = remove_settings_provider(app).await {
+            if app.settings_field_index == context_window_row() {
+                if code == KeyCode::Delete {
+                    app.context_window_input.clear();
+                }
+            } else if let Err(error) = remove_settings_provider(app).await {
                 app.current.status = format!("移除失败：{}", secrets::redact(&error.to_string()));
             }
         }
         KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
+            if app.settings_field_index == context_window_row() {
+                if character.is_ascii_digit() {
+                    app.context_window_input.push(character);
+                }
+            } else if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
                 let field = form.field();
                 form.edit(field, Some(character));
             }
@@ -2506,32 +2967,47 @@ async fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifie
     }
 }
 
+/// Mirrors the TUI row index onto the core form's `FIELDS` selection. The
+/// synthetic context-window row has no core `SettingsField`, so the core
+/// selection clamps to the last real field while it is highlighted.
+fn sync_form_selection(app: &mut App) {
+    // TUI rows: [Preset, Protocol, Model, BaseUrl, Thinking, ContextWindow,
+    // ApiKey]. The synthetic row maps onto the last core field so the form's
+    // own `field()` never indexes out of bounds; edits for it are intercepted
+    // before this mapping is consulted.
+    let index = app.settings_field_index.min(FIELDS.len().saturating_sub(1));
+    if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
+        form.selected = index;
+    }
+}
+
 async fn apply_settings(app: &mut App) -> Result<()> {
-    let (provider_config, _api_key, entered_key) = {
+    let (preset, model, base_url, kind, entered_key, context_window, form_provider) = {
         let form = app
             .settings
             .as_ref()
             .and_then(SettingsState::form)
             .context("provider editor is not open")?;
-        let active_key = secrets::api_key_cached_only(app.config.provider.preset)
-            .ok()
-            .map(|key| (app.config.provider.preset, key));
+        let provider = form.prepare()?;
+        let context_window = parse_context_window_override(&app.context_window_input)?;
         (
-            form.prepare()?,
-            form.resolve_api_key(active_key.as_ref())?,
+            provider.preset,
+            provider.model.clone(),
+            provider.base_url.clone(),
+            provider.kind,
             form.api_key.trim().to_owned(),
+            context_window,
+            provider,
         )
     };
 
-    app.handle
-        .set_provider_config(provider_config.clone())
-        .await?;
-    app.config.provider = provider_config.clone();
-    app.config.upsert_provider(provider_config.clone());
-    app.current.context_limit_tokens = provider_config.resolved_context_window_tokens();
-
-    let key_warning = if !entered_key.is_empty() {
-        secrets::store_api_key_cached(provider_config.preset, &entered_key)
+    // Ordering matters: `store_api_key_cached` seeds the in-process cache even
+    // when the OS keyring write fails, so the core's rebuilt runner can pick
+    // the new key up immediately. The warning below marks the degraded case.
+    let key_warning = if entered_key.is_empty() {
+        None
+    } else {
+        secrets::store_api_key_cached(preset, &entered_key)
             .err()
             .map(|error| {
                 format!(
@@ -2539,25 +3015,72 @@ async fn apply_settings(app: &mut App) -> Result<()> {
                     secrets::redact(&error.to_string())
                 )
             })
-    } else {
-        None
     };
-    let config_warning = app.config.save().err().map(|error| {
-        format!(
-            "配置仅本次运行有效：{}",
-            secrets::redact(&error.to_string())
+
+    // Thinking is an advanced full-profile field the profile endpoint does not
+    // carry. When the edited provider is active and the user changed it in the
+    // form, commit the merged full profile once instead of saving twice; for a
+    // non-active provider we keep the merge endpoint and warn that thinking is
+    // edited via the top-level menu once the provider is active.
+    let active = app.config.provider.preset == preset;
+    let thinking_changed = active
+        && (form_provider.thinking != app.config.provider.thinking
+            || form_provider.thinking_level != app.config.provider.thinking_level
+            || form_provider.thinking_budget_tokens != app.config.provider.thinking_budget_tokens);
+    let thinking_warning = (!active
+        && (form_provider.thinking != preset.defaults().thinking
+            || form_provider.thinking_level != preset.defaults().thinking_level
+            || form_provider.thinking_budget_tokens != preset.defaults().thinking_budget_tokens))
+        .then(|| "思考设置请在切换为当前供应商后通过顶部菜单修改".to_owned());
+
+    if thinking_changed {
+        let mut provider = app.config.provider.clone();
+        provider.preset = preset;
+        provider.model = model.clone();
+        if !base_url.trim().is_empty() {
+            provider.base_url = base_url.clone();
+        }
+        provider.kind = kind;
+        if let Some(window) = context_window {
+            provider.context_window_tokens = Some(window);
+        }
+        provider.thinking = form_provider.thinking;
+        provider.thinking_level = form_provider.thinking_level;
+        provider.thinking_budget_tokens = form_provider.thinking_budget_tokens;
+        provider.normalize_thinking();
+        if let Err(error) = app.handle.set_provider_config(provider).await {
+            return Err(anyhow::anyhow!(secrets::redact(&error.message)));
+        }
+    } else if let Err(error) = app
+        .handle
+        .set_provider_profile(
+            preset,
+            &model,
+            (!base_url.trim().is_empty()).then_some(base_url.as_str()),
+            Some(kind),
+            context_window,
         )
-    });
-    let warnings = [key_warning, config_warning]
+        .await
+    {
+        return Err(anyhow::anyhow!(secrets::redact(&error.message)));
+    }
+
+    // The core persisted the profile once; refresh every derived surface from
+    // the core instead of writing the local config a second time.
+    let _ = refresh_provider_settings(app).await;
+    let _ = load_provider_models(app, false).await;
+    app.current.context_limit_tokens = None;
+    app.sync_all().await?;
+    reopen_provider_list(app);
+    let warnings = [key_warning, thinking_warning]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(", ");
-    reopen_provider_list(app);
     app.current.status = format!(
         "就绪 | {} | {}{}",
-        provider_config.preset.label(),
-        provider_config.model,
+        preset.label(),
+        model,
         if warnings.is_empty() {
             String::new()
         } else {
@@ -2565,6 +3088,22 @@ async fn apply_settings(app: &mut App) -> Result<()> {
         },
     );
     Ok(())
+}
+
+/// Parses the optional context-window override. Empty inherits the merged
+/// profile value; a number is passed to the core, which clamps it.
+fn parse_context_window_override(input: &str) -> Result<Option<u64>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let value = input
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("上下文窗口必须是正整数"))?;
+    if value == 0 {
+        return Err(anyhow::anyhow!("上下文窗口必须是正整数"));
+    }
+    Ok(Some(value))
 }
 
 fn open_palette(app: &mut App) {
@@ -2684,8 +3223,11 @@ async fn remove_settings_provider(app: &mut App) -> Result<()> {
         .map(|form| form.provider.preset)
         .context("provider editor is not open")?;
     app.handle.remove_provider(preset).await?;
-    reload_config(app)?;
-    app.current.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
+    // Converge from the core view; never reload config as the authority.
+    let _ = refresh_provider_settings(app).await;
+    app.provider_models = ProviderModelsState::default();
+    let _ = load_provider_models(app, false).await;
+    app.sync_all().await?;
     reopen_provider_list(app);
     app.current.status = "供应商已移除；API Key 已保留在系统钥匙串".into();
     Ok(())

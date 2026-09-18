@@ -1951,7 +1951,7 @@ dependencies = [
 [[package]]
 name = "protium-core"
 version = "0.5.0"
-source = "git+https://github.com/olu-py/1H-Agent-core.git?branch=main#80a41c4284549c32b46c245c0f3a328a77c24948"
+source = "git+https://github.com/olu-py/1H-Agent-core.git?branch=main#7412962e43624d9db912c1270c179c8d664a50f0"
 dependencies = [
  "anyhow",
  "bytes",
