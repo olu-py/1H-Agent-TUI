@@ -869,6 +869,16 @@ impl TuiSessionProjection {
             self.output_scroll_top = None;
             self.follow_output = false;
             self.message_scroll = anchor;
+            // When the user is paging toward older history, keep the newly
+            // loaded older end and evict from the newer end. This prevents a
+            // long paging session from growing the projection forever while
+            // preserving the content currently being inspected.
+            let removed = trim_entries_from_end(&mut self.entries);
+            if removed > 0 {
+                self.invalidate_output_layout();
+                self.markdown_render_cache.clear();
+                self.clear_output_selection();
+            }
         } else {
             self.replace_history(entries);
         }
@@ -1142,6 +1152,20 @@ pub(crate) fn trim_entries(entries: &mut Vec<DisplayEntry>) -> usize {
             entries.remove(0);
             removed += 1;
         }
+    }
+    removed
+}
+
+fn trim_entries_from_end(entries: &mut Vec<DisplayEntry>) -> usize {
+    const MAX_ENTRIES: usize = 1000;
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    let mut removed = 0;
+    while entries.len() > MAX_ENTRIES || display_entry_bytes(entries) > MAX_BYTES {
+        if entries.is_empty() {
+            break;
+        }
+        entries.pop();
+        removed += 1;
     }
     removed
 }

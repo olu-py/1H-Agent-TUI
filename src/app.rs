@@ -2442,7 +2442,7 @@ impl App {
                 self.current.push_entry(DisplayEntry {
                     kind: DisplayKind::System,
                     content: DisplayContent::Markdown(
-                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/uncompact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/diff`\n`/plan` `/build` `/explore` `/cluster` `/model` `/provider` `/agent`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell\n\n搜索后端（DuckDuckGo/Bing）来自 config 的 [runtime].search_backend，TUI 不另存配置"
+                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/uncompact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/memory [search|add|candidate|confirm|edit|delete]` `/diff`\n`/plan` `/build` `/explore` `/cluster` `/model` `/provider` `/agent`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell\n\n搜索后端（DuckDuckGo/Bing）来自 config 的 [runtime].search_backend，TUI 不另存配置"
                             .into(),
                     ),
                 });
@@ -2503,6 +2503,10 @@ fn command_to_text(command: &Command) -> String {
         Command::Model(None) => "/model".into(),
         Command::Agent(Some(agent)) => format!("/agent {agent}"),
         Command::Agent(None) => "/agent".into(),
+        Command::Memory(argument) => argument
+            .as_deref()
+            .map(|argument| format!("/memory {argument}"))
+            .unwrap_or_else(|| "/memory".into()),
         Command::Mode(mode) => format!("/{}", mode.as_str()),
         Command::Todo(todo) => format!("/todo {}", todo_to_text(todo)),
         Command::Help | Command::Provider | Command::Clear | Command::Quit => unreachable!(),
