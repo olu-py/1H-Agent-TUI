@@ -109,6 +109,7 @@ pub struct ProviderModelsState {
 /// Result of a background `provider_models(true)` refresh.
 #[derive(Debug)]
 pub(crate) struct ModelRefreshResult {
+    pub generation: u64,
     pub preset: ProviderPreset,
     pub result: std::result::Result<ProviderModelsDto, String>,
 }
@@ -138,10 +139,16 @@ pub struct App {
     /// Last `provider_models(false)` answer for the active preset.
     pub provider_models: ProviderModelsState,
     /// Background model-refresh result channel (sender side).
-    pub(crate) model_refresh_tx: tokio::sync::mpsc::UnboundedSender<ModelRefreshResult>,
+    pub(crate) model_refresh_tx: tokio::sync::mpsc::Sender<ModelRefreshResult>,
     /// Background model-refresh result channel (receiver side; taken by the
     /// event loop so its `select!` branch never borrows the whole facade).
-    pub(crate) model_refresh_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ModelRefreshResult>>,
+    pub(crate) model_refresh_rx: Option<tokio::sync::mpsc::Receiver<ModelRefreshResult>>,
+    /// At most one provider model refresh may be in flight. The handle also
+    /// gives provider changes and shutdown an explicit cancellation path.
+    model_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic identity for refresh requests; results from older provider
+    /// state are ignored even if cancellation races with completion.
+    model_refresh_generation: u64,
     /// TUI-only settings selection: the core `FIELDS` rows followed by the
     /// synthetic context-window override row.
     pub settings_field_index: usize,
@@ -195,6 +202,14 @@ pub struct App {
     /// Set when the user scrolled to the top of the loaded history and older
     /// messages exist; the event loop drains it into `load_older_history`.
     pub history_load_pending: bool,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(task) = self.model_refresh_task.take() {
+            task.abort();
+        }
+    }
 }
 
 pub async fn run(workspace_path: PathBuf, mut config: Config) -> Result<()> {
@@ -411,7 +426,7 @@ async fn build_app(
     let sessions = snapshot.sessions.iter().map(session_summary).collect();
     let workspace_security = Workspace::new(&workspace)?;
     let context_meter_enabled = config.ui.context_meter;
-    let (model_refresh_tx, model_refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (model_refresh_tx, model_refresh_rx) = tokio::sync::mpsc::channel(1);
     let mut app = App {
         handle,
         workspace,
@@ -421,6 +436,8 @@ async fn build_app(
         provider_models: ProviderModelsState::default(),
         model_refresh_tx,
         model_refresh_rx: Some(model_refresh_rx),
+        model_refresh_task: None,
+        model_refresh_generation: 0,
         settings_field_index: 0,
         context_window_input: String::new(),
         input: InputBuffer::new(),
@@ -580,6 +597,8 @@ async fn event_loop(
                 if let Some(refresh) = refresh {
                     apply_model_refresh_result(app, refresh);
                     redraw = true;
+                } else {
+                    break;
                 }
             }
             _ = deferred_redraw_tick => {
@@ -661,6 +680,7 @@ async fn event_loop(
             terminal.draw(|frame| ui::draw(frame, app))?;
         }
     }
+    app.cancel_model_refresh();
     Ok(())
 }
 
@@ -1273,26 +1293,45 @@ async fn load_provider_models(app: &mut App, refresh: bool) -> Result<()> {
 /// Starts a background `provider_models(true)` refresh so the terminal event
 /// loop never blocks on the provider network round trip.
 fn spawn_model_refresh(app: &mut App) {
+    if app.model_refresh_task.is_some() {
+        return;
+    }
+    app.model_refresh_generation = app.model_refresh_generation.wrapping_add(1);
+    let generation = app.model_refresh_generation;
     let preset = app.active_preset();
     app.provider_models.loading = true;
     app.provider_models.last_error = None;
     app.current.status = "模型列表刷新中……".into();
     let handle = app.handle.clone();
     let sender = app.model_refresh_tx.clone();
-    tokio::spawn(async move {
+    app.model_refresh_task = Some(tokio::spawn(async move {
         let result = handle
             .provider_models(true)
             .await
             .map_err(|error| secrets::redact(&error.message));
-        let _ = sender.send(ModelRefreshResult { preset, result });
-    });
+        let _ = sender
+            .send(ModelRefreshResult {
+                generation,
+                preset,
+                result,
+            })
+            .await;
+    }));
 }
 
 fn apply_model_refresh_result(app: &mut App, refresh: ModelRefreshResult) {
+    if refresh.generation == app.model_refresh_generation {
+        // The send completed, so the task has no more work. Dropping the
+        // handle releases it before a subsequent refresh is accepted.
+        app.model_refresh_task.take();
+    } else {
+        // Never let an old task clear loading state belonging to a newer
+        // provider/model selection.
+        return;
+    }
     // A provider switch may have landed while the refresh was in flight; a
     // stale answer must never overwrite the new provider's model list.
     if app.active_preset() != refresh.preset {
-        app.provider_models.loading = false;
         return;
     }
     match refresh.result {
@@ -1522,6 +1561,7 @@ async fn apply_thinking_selection(
     provider.thinking_level = level;
     provider.thinking_budget_tokens = budget;
     provider.normalize_thinking();
+    app.cancel_model_refresh();
     app.handle.set_provider_config(provider.clone()).await?;
     app.config.provider = provider;
     app.current.status = format!("思考强度已设为 {}", level.label());
@@ -1907,6 +1947,14 @@ fn edge_scroll_direction(row: u16, viewport: ratatui::layout::Rect) -> i8 {
 }
 
 impl App {
+    fn cancel_model_refresh(&mut self) {
+        self.model_refresh_generation = self.model_refresh_generation.wrapping_add(1);
+        if let Some(task) = self.model_refresh_task.take() {
+            task.abort();
+        }
+        self.provider_models.loading = false;
+    }
+
     /// Core-authoritative active preset, falling back to the local config
     /// snapshot before the first `provider_settings()` read.
     pub(crate) fn active_preset(&self) -> ProviderPreset {
@@ -2127,6 +2175,7 @@ impl App {
         if preset == self.active_preset() {
             return Ok(());
         }
+        self.cancel_model_refresh();
         // Prefer the target preset's saved model; otherwise use its template
         // default. Carrying the old provider's model across would pair an
         // unrelated model id with the new provider.
@@ -2160,6 +2209,7 @@ impl App {
         if model.is_empty() {
             return Ok(());
         }
+        self.cancel_model_refresh();
         let preset = self.active_preset();
         if let Err(error) = self.handle.set_provider(preset.key_id(), &model).await {
             self.current.status = secrets::redact(&error.message);
@@ -3037,6 +3087,9 @@ async fn apply_settings(app: &mut App) -> Result<()> {
             || form_provider.thinking_budget_tokens != preset.defaults().thinking_budget_tokens))
         .then(|| "思考设置请在切换为当前供应商后通过顶部菜单修改".to_owned());
 
+    if active {
+        app.cancel_model_refresh();
+    }
     if thinking_changed {
         let mut provider = app.config.provider.clone();
         provider.preset = preset;
@@ -3226,6 +3279,7 @@ async fn remove_settings_provider(app: &mut App) -> Result<()> {
         .and_then(SettingsState::form)
         .map(|form| form.provider.preset)
         .context("provider editor is not open")?;
+    app.cancel_model_refresh();
     app.handle.remove_provider(preset).await?;
     // Converge from the core view; never reload config as the authority.
     let _ = refresh_provider_settings(app).await;
@@ -3268,6 +3322,39 @@ mod tests {
             .await
             .expect("build_app");
         (app, temp)
+    }
+
+    #[tokio::test]
+    async fn model_refresh_channel_is_bounded_to_one_result() {
+        let (app, _temp) = test_app().await;
+        let preset = app.active_preset();
+        let result = || ModelRefreshResult {
+            generation: 1,
+            preset,
+            result: Err("test".to_owned()),
+        };
+
+        assert!(app.model_refresh_tx.try_send(result()).is_ok());
+        assert!(app.model_refresh_tx.try_send(result()).is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_model_refresh_does_not_clear_newer_loading_state() {
+        let (mut app, _temp) = test_app().await;
+        app.model_refresh_generation = 2;
+        app.provider_models.loading = true;
+        let preset = app.active_preset();
+
+        apply_model_refresh_result(
+            &mut app,
+            ModelRefreshResult {
+                generation: 1,
+                preset,
+                result: Err("stale".to_owned()),
+            },
+        );
+
+        assert!(app.provider_models.loading);
     }
 
     #[tokio::test]
