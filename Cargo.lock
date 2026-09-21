@@ -1296,9 +1296,9 @@ dependencies = [
 
 [[package]]
 name = "ignore"
-version = "0.4.33"
+version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
+checksum = "d4ffa3a0547a138e59ddd6fa3b7c672ed47e6ad6a3cd177984ff1116aa5ba742"
 dependencies = [
  "crossbeam-deque",
  "globset",
@@ -1951,7 +1951,7 @@ dependencies = [
 [[package]]
 name = "protium-core"
 version = "0.5.0"
-source = "git+https://github.com/olu-py/1H-Agent-core.git?rev=06f760ddc7d2a94a06d63898ec3463eb3a85b3be#06f760ddc7d2a94a06d63898ec3463eb3a85b3be"
+source = "git+https://github.com/olu-py/1H-Agent-core.git?rev=1fc70d8e79b0831295ee78f56c6ed69e288822d8#1fc70d8e79b0831295ee78f56c6ed69e288822d8"
 dependencies = [
  "anyhow",
  "bytes",
