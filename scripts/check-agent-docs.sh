@@ -61,7 +61,7 @@ grep -Fq 'https://github.com/olu-py/1H-Agent-core' "$repo_root/README.md" \
     || fail "README.md does not link the core repository"
 grep -Fq 'git = "https://github.com/olu-py/1H-Agent-core.git"' "$repo_root/Cargo.toml" \
     || fail "Cargo.toml does not use the canonical core Git dependency"
-grep -Fq 'source = "git+https://github.com/olu-py/1H-Agent-core.git?branch=main#' "$repo_root/Cargo.lock" \
+grep -Fq 'source = "git+https://github.com/olu-py/1H-Agent-core.git?rev=' "$repo_root/Cargo.lock" \
     || fail "Cargo.lock does not pin a core Git commit"
 grep -Fq 'patch."https://github.com/olu-py/1H-Agent-core.git"' "$repo_root/README.md" \
     || fail "README.md does not document the local core path patch workflow"
