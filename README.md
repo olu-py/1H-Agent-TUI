@@ -104,15 +104,15 @@ cargo --config \
 
 ### 正式更新与交付
 
-先在独立的 [core 仓库](https://github.com/olu-py/1H-Agent-core) 完成测试、提交并 push `main`，再在本仓库运行：
+先在独立的 [core 仓库](https://github.com/olu-py/1H-Agent-core) 完成测试、提交并 push，再在本仓库使用固定的 40 位 core SHA 更新：
 
 ```bash
-cargo update -p protium-core
+./scripts/update-core.sh 06f760ddc7d2a94a06d63898ec3463eb3a85b3be
 cargo test --lib conformance
 cargo test --all-features --locked
 ```
 
-移除本地 patch，检查 metadata 来源和 `Cargo.lock` 中的 core Git commit，再在本仓库单独提交适配器与锁文件。普通 `cargo update` 会同时更新其他依赖，不适合仅升级 core。
+Windows 使用 `.\scripts\update-core.ps1 -Rev <40-char-sha>`。脚本会拒绝 dirty 的清单/锁文件，定向更新 `protium-core`，验证 metadata 来源为 Git SHA，且不会自动提交或 push。检查 `Cargo.toml` 与 `Cargo.lock` 指向同一 rev 后，再在本仓库单独提交适配器与锁文件。
 
 协议一致性夹具由 core 仓库维护；TUI conformance 测试通过 Git 依赖的 `test-util` feature 消费它们。不要修改 Cargo 缓存中的 checkout，也不要把 core 源码复制回本仓库。WebUI 是另一个独立消费端，见 [1H-Agent-webUI](https://github.com/olu-py/1H-Agent-webUI)。
 
