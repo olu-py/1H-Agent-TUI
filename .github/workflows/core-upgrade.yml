@@ -1,0 +1,75 @@
+name: Core upgrade
+
+on:
+  repository_dispatch:
+    types: [core-release]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: 40-character core commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: core-upgrade
+  cancel-in-progress: true
+
+jobs:
+  upgrade:
+    name: Prepare core upgrade PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libdbus-1-dev pkg-config
+      - name: Resolve core revision
+        id: core
+        env:
+          EVENT_SHA: ${{ github.event.client_payload.sha }}
+          INPUT_REV: ${{ inputs.rev }}
+        run: |
+          set -euo pipefail
+          rev="$EVENT_SHA"
+          if [ -z "$rev" ]; then
+            rev="$INPUT_REV"
+          fi
+          if [ -z "$rev" ]; then
+            rev="$(git ls-remote https://github.com/olu-py/1H-Agent-core.git refs/heads/main | awk '{print $1}')"
+          fi
+          printf '%s' "$rev" | grep -Eq '^[0-9a-fA-F]{40}$'
+          old_rev="$(git show HEAD:Cargo.toml | sed -n 's/.*protium-core.*rev = "\([0-9a-fA-F]\{40\}\)".*/\1/p')"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "old_rev=$old_rev" >> "$GITHUB_OUTPUT"
+      - name: Update and verify
+        env:
+          REV: ${{ steps.core.outputs.rev }}
+        run: |
+          bash scripts/update-core.sh "$REV"
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-features --locked
+          cargo build --release --locked
+      - name: Create upgrade PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/core-${{ steps.core.outputs.rev }}
+          delete-branch: true
+          commit-message: "build: update protium-core to ${{ steps.core.outputs.rev }}"
+          title: "build: update protium-core to ${{ steps.core.outputs.rev }}"
+          body: |
+            Updates `protium-core` from `${{ steps.core.outputs.old_rev }}` to `${{ steps.core.outputs.rev }}`.
+
+            Core release: https://github.com/olu-py/1H-Agent-core/commit/${{ steps.core.outputs.rev }}
+
+            Verification: `cargo fmt --all -- --check`, Clippy, full locked tests, and release build.
+          labels: dependencies
