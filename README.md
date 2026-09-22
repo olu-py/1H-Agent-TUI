@@ -86,6 +86,12 @@ cargo build --release --locked --bin 1h-agent
 ./target/release/1h-agent --workspace /path/to/project
 ```
 
+长会话性能基线与普通测试分开运行，覆盖 10k 消息投影、缓存裁剪、Unicode/Markdown 风格行的换宽与可见区裁剪：
+
+```bash
+cargo bench --bench consumer --locked
+```
+
 ## 更新 protium-core
 
 这一节只面向维护者。普通构建不会自动追踪 core 的 `main`：`Cargo.lock` 锁定具体 commit，只有提交新的锁文件后，其他用户才会获得新版 core。

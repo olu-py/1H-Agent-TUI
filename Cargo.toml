@@ -37,10 +37,15 @@ unicode-segmentation = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = { workspace = true }
 # Enables the shared conformance corpus (scenarios + stream invariants) so the
 # TUI replay tests consume the exact same fixtures the core asserts against.
 protium-core = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "consumer"
+harness = false
 
 [workspace]
 resolver = "2"
