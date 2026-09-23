@@ -21,6 +21,8 @@
 - 权威流程：版本校验 -> 三平台验证 -> 四目标归档和安装包 -> checksums -> GitHub Release。
 - 归档保留 README、LICENSE、第三方声明和示例配置；Release 包含归档、DEB、MSI、checksums 和 notices。
 - 不假定本机有 `gh`；凭据不得进入命令、文件、日志或回复，Actions 使用最小权限 token。
+- required checks 保持 `Linux quality`、`Test (macos-latest)`、`Test (windows-latest)`；实际 runner 固定 Ubuntu 24.04、macOS 26、Windows 2025。
+- Action 固定完整 SHA 并由每周 Dependabot 分组更新；checkout 不保留凭据，CI 仅允许 `main` 写缓存，release/自动升级只读。
 
 ## 诊断
 

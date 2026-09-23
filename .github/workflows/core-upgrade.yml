@@ -23,15 +23,12 @@ concurrency:
 jobs:
   upgrade:
     name: Prepare core upgrade PR
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libdbus-1-dev pkg-config
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Resolve core revision
         id: core
         env:
@@ -50,7 +47,27 @@ jobs:
           old_rev="$(git show HEAD:Cargo.toml | sed -n 's/.*protium-core.*rev = "\([0-9a-fA-F]\{40\}\)".*/\1/p')"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
           echo "old_rev=$old_rev" >> "$GITHUB_OUTPUT"
+          if [ "$rev" = "$old_rev" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Core is already pinned to $rev; no upgrade is needed."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        if: steps.core.outputs.changed == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.core.outputs.changed == 'true'
+        with:
+          save-if: false
+      - name: Install Linux system dependencies
+        if: steps.core.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libdbus-1-dev pkg-config
       - name: Update and verify
+        if: steps.core.outputs.changed == 'true'
         env:
           REV: ${{ steps.core.outputs.rev }}
         run: |
@@ -60,8 +77,10 @@ jobs:
           cargo test --all-features --locked
           cargo build --release --locked
       - name: Create upgrade PR
-        uses: peter-evans/create-pull-request@v7
+        if: steps.core.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
+          token: ${{ github.token }}
           branch: automation/core-${{ steps.core.outputs.rev }}
           delete-branch: true
           commit-message: "build: update protium-core to ${{ steps.core.outputs.rev }}"
@@ -73,3 +92,6 @@ jobs:
 
             Verification: `cargo fmt --all -- --check`, Clippy, full locked tests, and release build.
           labels: dependencies
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
