@@ -20,13 +20,7 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
         if let Some(outcome) = handle_settings_mouse(app, mouse)? {
             return Ok(outcome);
         }
-        if let Some(outcome) = handle_thinking_mouse(app, mouse).await? {
-            return Ok(outcome);
-        }
-        if let Some(outcome) = handle_provider_mouse(app, mouse).await? {
-            return Ok(outcome);
-        }
-        if let Some(outcome) = handle_model_mouse(app, mouse).await? {
+        if let Some(outcome) = handle_footer_mouse(app, mouse).await? {
             return Ok(outcome);
         }
         if let Some(outcome) = handle_navigation_mouse(app, mouse).await? {
@@ -100,21 +94,8 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
             osc52: None,
         });
     }
-    if app.provider_menu_open {
-        let redraw = provider_menu_key_handled(key.code);
-        handle_provider_menu_key(app, key.code).await?;
-        return Ok(EventOutcome {
-            redraw,
-            osc52: None,
-        });
-    }
-    if app.model_menu_open {
-        let redraw = model_menu_key_handled(key.code);
-        handle_model_menu_key(app, key.code).await?;
-        return Ok(EventOutcome {
-            redraw,
-            osc52: None,
-        });
+    if app.provider_menu_open || app.model_menu_open || app.thinking_menu_open {
+        return handle_footer_menu_key(app, key.code).await;
     }
     if app.palette.is_some() {
         let redraw = palette_key_handled(key.code, key.modifiers);
@@ -124,19 +105,21 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
             osc52: None,
         });
     }
-    if app.thinking_menu_open {
-        let selected = app
-            .thinking_menu_rect
-            .and_then(|rect| thinking_menu_selection(app, rect, u16::MAX, u16::MAX));
-        app.thinking_menu_open = false;
-        app.force_full_redraw = true;
-        if let Some((level, budget)) = selected {
-            apply_thinking_selection(app, level, budget).await?;
-        }
-        return Ok(EventOutcome::redraw());
-    }
 
     let redraw = match key.code {
+        KeyCode::Char('p' | 'm' | 't')
+            if key.modifiers.contains(KeyModifiers::ALT) && !app.current.busy =>
+        {
+            // Alt+P/M/T open the footer pickers, so provider, model and thinking
+            // level stay reachable without a mouse.
+            let menu = match key.code {
+                KeyCode::Char('m') => FooterMenu::Model,
+                KeyCode::Char('t') => FooterMenu::Thinking,
+                _ => FooterMenu::Provider,
+            };
+            open_footer_menu(app, menu).await?;
+            true
+        }
         KeyCode::Char('p' | 'x')
             if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
         {
@@ -348,39 +331,4 @@ fn handle_settings_mouse(
         SettingsState::Form(_) => {}
     }
     Ok(Some(EventOutcome::redraw()))
-}
-
-async fn handle_thinking_mouse(
-    app: &mut App,
-    mouse: crossterm::event::MouseEvent,
-) -> Result<Option<EventOutcome>> {
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return Ok(app.thinking_menu_open.then(EventOutcome::default));
-    }
-    if app.thinking_menu_open {
-        let selected = app
-            .thinking_menu_rect
-            .filter(|rect| point_in_rect(mouse.column, mouse.row, *rect))
-            .and_then(|rect| thinking_menu_selection(app, rect, mouse.column, mouse.row));
-        app.thinking_menu_open = false;
-        app.force_full_redraw = true;
-        if let Some((level, budget)) = selected {
-            apply_thinking_selection(app, level, budget).await?;
-        }
-        return Ok(Some(EventOutcome::redraw()));
-    }
-    if !app.current.busy
-        && !app.has_pending_approval()
-        && app
-            .thinking_control_rect
-            .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
-    {
-        app.model_menu_open = false;
-        app.model_menu_rect = None;
-        app.provider_menu_open = false;
-        app.provider_menu_rect = None;
-        app.thinking_menu_open = true;
-        return Ok(Some(EventOutcome::redraw()));
-    }
-    Ok(None)
 }

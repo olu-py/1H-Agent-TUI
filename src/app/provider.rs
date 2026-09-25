@@ -1,4 +1,8 @@
 use super::*;
+use crate::ui_view_model::{
+    THINKING_LEVEL_COLUMN_WIDTH, ThinkingMenuCell, ThinkingMenuColumn, thinking_menu_columns,
+    thinking_menu_rows,
+};
 
 /// Model picker entries for the active provider.
 ///
@@ -224,6 +228,95 @@ pub(super) fn apply_model_refresh_result(app: &mut App, refresh: ModelRefreshRes
     }
 }
 
+/// Which footer picker a click or key acts on. Only one picker is open at a
+/// time, and opening one closes the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FooterMenu {
+    Provider,
+    Model,
+    Thinking,
+}
+
+/// Closes every footer picker and drops the painted geometry with it, so a
+/// rectangle from before a resize can never be hit-tested again.
+pub(super) fn close_footer_menus(app: &mut App) {
+    app.thinking_menu_open = false;
+    app.thinking_menu_geometry = None;
+    app.provider_menu_open = false;
+    app.provider_menu_geometry = None;
+    app.model_menu_open = false;
+    app.model_menu_geometry = None;
+}
+
+/// Opens one footer picker and parks its cursor on the value that is applied
+/// today, after re-reading the state the list is derived from. Enter then always
+/// confirms a visible row instead of a leftover index from another provider or
+/// model, and a click on the row the user sees is that same row.
+pub(super) async fn open_footer_menu(app: &mut App, menu: FooterMenu) -> Result<()> {
+    close_footer_menus(app);
+    match menu {
+        FooterMenu::Provider => {
+            let _ = refresh_provider_settings(app).await;
+            let active = app.active_preset();
+            app.provider_menu_selected = provider_choices(app)
+                .iter()
+                .position(|preset| *preset == active)
+                .unwrap_or(0);
+            app.provider_menu_open = true;
+        }
+        FooterMenu::Model => {
+            let _ = load_provider_models(app, false).await;
+            let model = app.active_model().to_owned();
+            app.model_menu_selected = model_choices(app)
+                .iter()
+                .position(|choice| choice.id == model)
+                .unwrap_or(0);
+            app.model_menu_open = true;
+        }
+        FooterMenu::Thinking => {
+            let columns = thinking_menu_columns(app);
+            let row = columns
+                .first()
+                .and_then(|column| column.cells.iter().position(|cell| cell.active))
+                .unwrap_or(0);
+            app.thinking_menu_cursor = ThinkingMenuCursor { row, column: 0 }
+                .clamped(thinking_menu_rows(&columns), columns.len());
+            app.thinking_menu_open = true;
+        }
+    }
+    Ok(())
+}
+
+/// Moves a picker cursor with wrap-around, and clamps a stale index back onto
+/// the live list so Enter can never index past the end of it.
+fn move_menu_cursor(selected: &mut usize, code: KeyCode, items: usize) {
+    if items == 0 {
+        *selected = 0;
+        return;
+    }
+    let last = items - 1;
+    if *selected > last {
+        // The list shrank while the picker stayed open: the next key reels the
+        // cursor back onto the live list instead of wrapping it away from the
+        // row the painter highlights, so Enter can never address a blank row.
+        *selected = last;
+        return;
+    }
+    *selected = match code {
+        KeyCode::Up => (*selected + last) % items,
+        KeyCode::Down => (*selected + 1) % items,
+        _ => *selected,
+    };
+}
+
+/// True when the click landed on a footer control whose text is fully visible
+/// in this frame: a clipped label never opens a picker.
+fn footer_control_hit(app: &App, mouse: &crossterm::event::MouseEvent, rect: Option<Rect>) -> bool {
+    !app.current.busy
+        && !app.has_pending_approval()
+        && rect.is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
+}
+
 pub(super) async fn handle_provider_mouse(
     app: &mut App,
     mouse: crossterm::event::MouseEvent,
@@ -233,43 +326,33 @@ pub(super) async fn handle_provider_mouse(
     }
     if app.provider_menu_open {
         let selected = app
-            .provider_menu_rect
-            .filter(|rect| point_in_rect(mouse.column, mouse.row, *rect))
-            .and_then(|rect| provider_menu_selection(app, rect, mouse.column, mouse.row));
-        app.provider_menu_open = false;
-        app.force_full_redraw = true;
+            .provider_menu_geometry
+            .filter(|picker| picker.contains(mouse.column, mouse.row))
+            .and_then(|picker| provider_menu_selection(app, picker, mouse.column, mouse.row));
+        close_footer_menus(app);
         if let Some(preset) = selected {
             app.apply_provider_choice(preset).await?;
         }
         return Ok(Some(EventOutcome::redraw()));
     }
-    if !app.current.busy
-        && !app.has_pending_approval()
-        && app
-            .provider_control_rect
-            .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
-    {
-        app.model_menu_open = false;
-        app.model_menu_rect = None;
-        app.provider_menu_open = true;
-        let _ = refresh_provider_settings(app).await;
+    let control = app.provider_control_rect;
+    if footer_control_hit(app, &mouse, control) {
+        open_footer_menu(app, FooterMenu::Provider).await?;
         return Ok(Some(EventOutcome::redraw()));
     }
     Ok(None)
 }
 
+/// Provider on the painted row under the cursor.
 pub(super) fn provider_menu_selection(
     app: &App,
-    rect: Rect,
+    picker: PickerGeometry,
     column: u16,
     row: u16,
 ) -> Option<ProviderPreset> {
-    let inner = ratatui::widgets::Block::bordered().inner(rect);
-    if !point_in_rect(column, row, inner) {
-        return None;
-    }
-    let index = row.saturating_sub(inner.y) as usize;
-    provider_choices(app).get(index).copied()
+    picker
+        .item_at(column, row)
+        .and_then(|index| provider_choices(app).get(index).copied())
 }
 
 pub(super) fn provider_menu_key_handled(code: KeyCode) -> bool {
@@ -280,29 +363,17 @@ pub(super) fn provider_menu_key_handled(code: KeyCode) -> bool {
 }
 
 pub(super) async fn handle_provider_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
-    let choices = provider_choices(app);
-    if choices.is_empty() {
+    if code == KeyCode::Esc {
+        close_footer_menus(app);
         return Ok(());
     }
-    match code {
-        KeyCode::Esc => {
-            app.provider_menu_open = false;
-            app.provider_menu_rect = None;
+    let choices = provider_choices(app);
+    move_menu_cursor(&mut app.provider_menu_selected, code, choices.len());
+    if code == KeyCode::Enter {
+        if let Some(preset) = choices.get(app.provider_menu_selected).copied() {
+            close_footer_menus(app);
+            app.apply_provider_choice(preset).await?;
         }
-        KeyCode::Up => {
-            app.provider_menu_selected =
-                (app.provider_menu_selected + choices.len() - 1) % choices.len();
-        }
-        KeyCode::Down => {
-            app.provider_menu_selected = (app.provider_menu_selected + 1) % choices.len();
-        }
-        KeyCode::Enter => {
-            app.apply_provider_choice(choices[app.provider_menu_selected])
-                .await?;
-            app.provider_menu_open = false;
-            app.provider_menu_rect = None;
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -316,40 +387,37 @@ pub(super) async fn handle_model_mouse(
     }
     if app.model_menu_open {
         let selected = app
-            .model_menu_rect
-            .filter(|rect| point_in_rect(mouse.column, mouse.row, *rect))
-            .and_then(|rect| model_menu_selection(app, rect, mouse.column, mouse.row));
-        app.model_menu_open = false;
-        app.force_full_redraw = true;
+            .model_menu_geometry
+            .filter(|picker| picker.contains(mouse.column, mouse.row))
+            .and_then(|picker| model_menu_selection(app, picker, mouse.column, mouse.row));
+        close_footer_menus(app);
         if let Some(model) = selected {
             app.apply_model_choice(model).await?;
         }
         return Ok(Some(EventOutcome::redraw()));
     }
-    if !app.current.busy
-        && !app.has_pending_approval()
-        && app
-            .model_control_rect
-            .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
-    {
-        app.provider_menu_open = false;
-        app.provider_menu_rect = None;
-        app.model_menu_open = true;
-        let _ = load_provider_models(app, false).await;
+    let control = app.model_control_rect;
+    if footer_control_hit(app, &mouse, control) {
+        open_footer_menu(app, FooterMenu::Model).await?;
         return Ok(Some(EventOutcome::redraw()));
     }
     Ok(None)
 }
 
-pub(super) fn model_menu_selection(app: &App, rect: Rect, column: u16, row: u16) -> Option<String> {
-    let inner = ratatui::widgets::Block::bordered().inner(rect);
-    if !point_in_rect(column, row, inner) {
-        return None;
-    }
-    let index = row.saturating_sub(inner.y) as usize;
-    model_choices(app)
-        .get(index)
-        .map(|choice| choice.id.clone())
+/// Model on the painted row under the cursor: the picker scrolls once the list
+/// is longer than the window, so the row has to be resolved through the same
+/// window the painter used or a click would apply a different model.
+pub(super) fn model_menu_selection(
+    app: &App,
+    picker: PickerGeometry,
+    column: u16,
+    row: u16,
+) -> Option<String> {
+    picker.item_at(column, row).and_then(|index| {
+        model_choices(app)
+            .get(index)
+            .map(|choice| choice.id.clone())
+    })
 }
 
 pub(super) fn model_menu_key_handled(code: KeyCode) -> bool {
@@ -361,31 +429,23 @@ pub(super) fn model_menu_key_handled(code: KeyCode) -> bool {
 
 pub(super) async fn handle_model_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
     if code == KeyCode::Char('r') {
+        // `r` refreshes the dynamic list in the background; the picker stays
+        // open and repaints when the answer arrives.
         spawn_model_refresh(app);
         return Ok(());
     }
-    let choices = model_choices(app);
-    if choices.is_empty() {
+    if code == KeyCode::Esc {
+        close_footer_menus(app);
         return Ok(());
     }
-    match code {
-        KeyCode::Esc => {
-            app.model_menu_open = false;
-            app.model_menu_rect = None;
-        }
-        KeyCode::Up => {
-            app.model_menu_selected = (app.model_menu_selected + choices.len() - 1) % choices.len();
-        }
-        KeyCode::Down => {
-            app.model_menu_selected = (app.model_menu_selected + 1) % choices.len();
-        }
-        KeyCode::Enter => {
-            let model = choices[app.model_menu_selected].id.clone();
+    let choices = model_choices(app);
+    move_menu_cursor(&mut app.model_menu_selected, code, choices.len());
+    if code == KeyCode::Enter {
+        if let Some(choice) = choices.get(app.model_menu_selected) {
+            let model = choice.id.clone();
+            close_footer_menus(app);
             app.apply_model_choice(model).await?;
-            app.model_menu_open = false;
-            app.model_menu_rect = None;
         }
-        _ => {}
     }
     Ok(())
 }
@@ -394,54 +454,218 @@ pub(super) fn point_in_rect(column: u16, row: u16, rect: Rect) -> bool {
     column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
+/// Thinking cell on the painted row under the cursor. The level column owns the
+/// left [`THINKING_LEVEL_COLUMN_WIDTH`] cells of a row and everything right of
+/// it is the Qwen3.7 budget column, so both columns resolve through the same row
+/// window the painter used.
 pub(super) fn thinking_menu_selection(
     app: &App,
-    rect: Rect,
+    picker: PickerGeometry,
     column: u16,
     row: u16,
-) -> Option<(ThinkingLevel, Option<u32>)> {
-    let inner = ratatui::widgets::Block::bordered().inner(rect);
-    if !point_in_rect(column, row, inner) {
-        return None;
-    }
-    let profile = app.thinking_profile();
-    let index = row.saturating_sub(inner.y) as usize;
-    if profile.kind == ThinkingProfileKind::Qwen37 && column >= inner.x.saturating_add(8) {
-        const BUDGETS: [Option<u32>; 6] = [
-            None,
-            Some(1024),
-            Some(4096),
-            Some(8192),
-            Some(16384),
-            Some(32768),
-        ];
-        return BUDGETS
-            .get(index)
-            .copied()
-            .map(|budget| (ThinkingLevel::Enabled, budget));
-    }
-    profile.options.get(index).copied().map(|level| {
-        let budget = (level == ThinkingLevel::Enabled)
-            .then_some(app.config.provider.thinking_budget_tokens)
-            .flatten();
-        (level, budget)
-    })
+) -> Option<ThinkingMenuCell> {
+    let index = picker.item_at(column, row)?;
+    let columns = thinking_menu_columns(app);
+    let budget = usize::from(
+        columns.len() > 1 && column >= picker.inner().x.saturating_add(THINKING_LEVEL_COLUMN_WIDTH),
+    );
+    thinking_menu_cell(&columns, budget, index).cloned()
 }
 
-pub(super) async fn apply_thinking_selection(
+/// Cell at (`column`, `row`) of the thinking table, or `None` where a shorter
+/// column leaves a blank row that paints no cell.
+fn thinking_menu_cell(
+    columns: &[ThinkingMenuColumn],
+    column: usize,
+    row: usize,
+) -> Option<&ThinkingMenuCell> {
+    columns.get(column)?.cells.get(row)
+}
+
+pub(super) fn thinking_menu_key_handled(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Esc
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Enter
+    )
+}
+
+/// ↑/↓ walk the cells of the highlighted column, ←/→ switch between the thinking
+/// level and the Qwen3.7 budget column, Enter applies the highlighted cell and
+/// Esc dismisses the picker.
+pub(super) async fn handle_thinking_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
+    if code == KeyCode::Esc {
+        close_footer_menus(app);
+        return Ok(());
+    }
+    let columns = thinking_menu_columns(app);
+    if columns.is_empty() {
+        close_footer_menus(app);
+        return Ok(());
+    }
+    let mut cursor = app
+        .thinking_menu_cursor
+        .clamped(thinking_menu_rows(&columns), columns.len());
+    match code {
+        KeyCode::Up | KeyCode::Down => {
+            let cells = columns[cursor.column].cells.len();
+            if cells > 0 {
+                let row = cursor.row.min(cells - 1);
+                cursor.row = if code == KeyCode::Up {
+                    (row + cells - 1) % cells
+                } else {
+                    (row + 1) % cells
+                };
+            }
+        }
+        KeyCode::Left if cursor.column > 0 => {
+            let target = cursor.column - 1;
+            move_thinking_column(&mut cursor, &columns, target);
+        }
+        KeyCode::Right => {
+            let target = cursor.column + 1;
+            if target < columns.len() {
+                move_thinking_column(&mut cursor, &columns, target);
+            }
+        }
+        KeyCode::Enter => {
+            let Some(cell) = thinking_menu_cell(&columns, cursor.column, cursor.row).cloned()
+            else {
+                return Ok(());
+            };
+            close_footer_menus(app);
+            return apply_thinking_choice(app, &cell).await;
+        }
+        _ => {}
+    }
+    app.thinking_menu_cursor = cursor;
+    Ok(())
+}
+
+/// Switches the thinking cursor to another column, keeping the row inside it.
+fn move_thinking_column(
+    cursor: &mut ThinkingMenuCursor,
+    columns: &[ThinkingMenuColumn],
+    target: usize,
+) {
+    cursor.column = target.min(columns.len() - 1);
+    cursor.row = cursor
+        .row
+        .min(columns[cursor.column].cells.len().saturating_sub(1));
+}
+
+pub(super) async fn handle_thinking_mouse(
     app: &mut App,
-    level: ThinkingLevel,
-    budget: Option<u32>,
-) -> Result<()> {
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(app.thinking_menu_open.then(EventOutcome::default));
+    }
+    if app.thinking_menu_open {
+        let selected = app
+            .thinking_menu_geometry
+            .filter(|picker| picker.contains(mouse.column, mouse.row))
+            .and_then(|picker| thinking_menu_selection(app, picker, mouse.column, mouse.row));
+        close_footer_menus(app);
+        if let Some(cell) = selected {
+            apply_thinking_choice(app, &cell).await?;
+        }
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    let control = app.thinking_control_rect;
+    if footer_control_hit(app, &mouse, control) {
+        open_footer_menu(app, FooterMenu::Thinking).await?;
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    Ok(None)
+}
+
+/// Applies one thinking cell through the core. A rejected profile is reported on
+/// the status line instead of bubbling out of the terminal event loop, which
+/// would tear the whole session down over a single picker selection.
+pub(super) async fn apply_thinking_choice(app: &mut App, cell: &ThinkingMenuCell) -> Result<()> {
     let mut provider = app.config.provider.clone();
-    provider.thinking_level = level;
-    provider.thinking_budget_tokens = budget;
+    provider.thinking_level = cell.level;
+    provider.thinking_budget_tokens = cell.budget;
     provider.normalize_thinking();
     app.cancel_model_refresh();
-    app.handle.set_provider_config(provider.clone()).await?;
+    if let Err(error) = app.handle.set_provider_config(provider.clone()).await {
+        app.current.status = format!(
+            "思考{}设置失败：{}",
+            cell.kind.noun(),
+            secrets::redact(&error.message)
+        );
+        return Ok(());
+    }
     app.config.provider = provider;
-    app.current.status = format!("思考强度已设为 {}", level.label());
+    app.current.status = format!("思考{}已设为 {}", cell.kind.noun(), cell.label);
     let _ = refresh_provider_settings(app).await;
     app.sync_all().await?;
     Ok(())
+}
+
+/// True while any footer picker is painted over the transcript.
+fn any_footer_menu_open(app: &App) -> bool {
+    app.thinking_menu_open || app.provider_menu_open || app.model_menu_open
+}
+
+/// Routes one terminal event to the footer picker that owns the screen, then to
+/// the footer controls that open a picker. Keeping the routing here means the
+/// three pickers share one dismiss, one click and one key contract.
+pub(super) async fn handle_footer_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    if app.thinking_menu_open {
+        return handle_thinking_mouse(app, mouse).await;
+    }
+    if app.provider_menu_open {
+        return handle_provider_mouse(app, mouse).await;
+    }
+    if app.model_menu_open {
+        return handle_model_mouse(app, mouse).await;
+    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) || any_footer_menu_open(app) {
+        return Ok(None);
+    }
+    for (menu, control) in [
+        (FooterMenu::Thinking, app.thinking_control_rect),
+        (FooterMenu::Provider, app.provider_control_rect),
+        (FooterMenu::Model, app.model_control_rect),
+    ] {
+        if footer_control_hit(app, &mouse, control) {
+            open_footer_menu(app, menu).await?;
+            return Ok(Some(EventOutcome::redraw()));
+        }
+    }
+    Ok(None)
+}
+
+/// Routes one key to the open footer picker. A key the picker does not use
+/// dismisses it the same way a click outside the frame does, so the next
+/// keystroke reaches the composer instead of vanishing behind the popup.
+pub(super) async fn handle_footer_menu_key(app: &mut App, code: KeyCode) -> Result<EventOutcome> {
+    let handled = if app.provider_menu_open {
+        provider_menu_key_handled(code)
+    } else if app.model_menu_open {
+        model_menu_key_handled(code)
+    } else {
+        thinking_menu_key_handled(code)
+    };
+    if !handled {
+        close_footer_menus(app);
+        return Ok(EventOutcome::redraw());
+    }
+    if app.provider_menu_open {
+        handle_provider_menu_key(app, code).await?;
+    } else if app.model_menu_open {
+        handle_model_menu_key(app, code).await?;
+    } else {
+        handle_thinking_menu_key(app, code).await?;
+    }
+    Ok(EventOutcome::redraw())
 }

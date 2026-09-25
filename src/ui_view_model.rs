@@ -69,20 +69,113 @@ pub struct ContextView {
     pub estimated: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThinkingMenuKind {
+    Level,
+    Budget,
+}
+
+impl ThinkingMenuKind {
+    /// Word used in the status line after a picker selection.
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Level => "强度",
+            Self::Budget => "预算",
+        }
+    }
+}
+
+/// One selectable cell of the thinking picker: the painted label plus the
+/// (level, budget) pair it applies. The painter, the keyboard cursor and the
+/// mouse hit-test all resolve cells through [`thinking_menu_columns`], so a
+/// rendered row and a clicked row can never drift apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThinkingMenuItem {
-    pub level: ThinkingLevel,
+pub struct ThinkingMenuCell {
     pub label: String,
-    pub selected: bool,
+    /// True for the cell matching the value the profile applies today.
+    pub active: bool,
+    pub kind: ThinkingMenuKind,
+    pub level: ThinkingLevel,
+    pub budget: Option<u32>,
+}
+
+/// One picker column and the cells it paints, top to bottom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThinkingMenuColumn {
+    pub kind: ThinkingMenuKind,
+    pub cells: Vec<ThinkingMenuCell>,
+}
+
+/// Cells the level column paints; the budget column starts right after it.
+pub const THINKING_LEVEL_COLUMN_WIDTH: u16 = 8;
+
+/// Thinking budgets the Qwen3.7 profile offers, in popup row order.
+pub const THINKING_BUDGETS: [(Option<u32>, &str); 6] = [
+    (None, "默认"),
+    (Some(1024), "1k"),
+    (Some(4096), "4k"),
+    (Some(8192), "8k"),
+    (Some(16384), "16k"),
+    (Some(32768), "32k"),
+];
+
+/// Builds the thinking picker table for the profile in effect: the level
+/// column plus, for Qwen3.7 only, a budget column that keeps thinking Enabled.
+pub fn thinking_menu_columns(app: &App) -> Vec<ThinkingMenuColumn> {
+    let profile = app.thinking_profile();
+    let level_cells = profile
+        .options
+        .iter()
+        .copied()
+        .map(|level| ThinkingMenuCell {
+            label: level.menu_label().to_owned(),
+            active: level == app.thinking_level(),
+            kind: ThinkingMenuKind::Level,
+            level,
+            budget: (level == ThinkingLevel::Enabled)
+                .then_some(app.thinking_budget_tokens())
+                .flatten(),
+        })
+        .collect();
+    let mut columns = vec![ThinkingMenuColumn {
+        kind: ThinkingMenuKind::Level,
+        cells: level_cells,
+    }];
+    if profile.kind == ThinkingProfileKind::Qwen37 {
+        columns.push(ThinkingMenuColumn {
+            kind: ThinkingMenuKind::Budget,
+            cells: THINKING_BUDGETS
+                .iter()
+                .map(|(budget, label)| ThinkingMenuCell {
+                    label: (*label).to_owned(),
+                    active: app.thinking_level() == ThinkingLevel::Enabled
+                        && app.thinking_budget_tokens() == *budget,
+                    kind: ThinkingMenuKind::Budget,
+                    level: ThinkingLevel::Enabled,
+                    budget: *budget,
+                })
+                .collect(),
+        });
+    }
+    columns
+}
+
+/// Rows the picker paints: the tallest column decides, so shorter columns paint
+/// blank cells (nothing selectable on those rows).
+pub fn thinking_menu_rows(columns: &[ThinkingMenuColumn]) -> usize {
+    columns
+        .iter()
+        .map(|column| column.cells.len())
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThinkingControlView {
     pub label: String,
     pub enabled: bool,
-    pub options: Vec<ThinkingMenuItem>,
-    pub qwen37_budgets: bool,
-    pub budget_tokens: Option<u32>,
+    /// Picker columns, built by [`thinking_menu_columns`].
+    pub columns: Vec<ThinkingMenuColumn>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,25 +361,14 @@ impl UiViewModel {
                 .as_ref()
                 .is_some_and(|budget| budget.estimated),
         };
-        let profile = app.thinking_profile();
+        let columns = thinking_menu_columns(app);
         let thinking = ThinkingControlView {
-            label: format!("思考 {} ▾", app.thinking_level().label()),
+            label: thinking_control_label(app, &columns),
             enabled: !app.current.busy
                 && !app.has_pending_approval()
                 && app.settings.is_none()
                 && app.palette.is_none(),
-            options: profile
-                .options
-                .iter()
-                .copied()
-                .map(|level| ThinkingMenuItem {
-                    level,
-                    label: level.menu_label().into(),
-                    selected: level == app.thinking_level(),
-                })
-                .collect(),
-            qwen37_budgets: profile.kind == ThinkingProfileKind::Qwen37,
-            budget_tokens: app.thinking_budget_tokens(),
+            columns,
         };
         let activity_width = UnicodeWidthStr::width(activity.text.as_str()) + 3;
         let shortcut_budget = footer_width.saturating_sub(activity_width.saturating_add(2));
@@ -348,6 +430,23 @@ impl UiViewModel {
             density,
             height,
         }
+    }
+}
+
+/// Footer label for the thinking control: the level plus the token budget when
+/// the profile has one, so a budget pick stays visible without reopening the
+/// popup.
+fn thinking_control_label(app: &App, columns: &[ThinkingMenuColumn]) -> String {
+    let budget = columns
+        .iter()
+        .filter(|column| column.kind == ThinkingMenuKind::Budget)
+        .flat_map(|column| column.cells.iter())
+        .find(|cell| cell.active)
+        .and_then(|cell| cell.budget);
+    let level = app.thinking_level().label();
+    match budget {
+        Some(budget) => format!("思考 {level}·{} ▾", compact_tokens(budget.into())),
+        None => format!("思考 {level} ▾"),
     }
 }
 

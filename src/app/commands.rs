@@ -288,7 +288,7 @@ impl App {
                 self.current.push_entry(DisplayEntry {
                     kind: DisplayKind::System,
                     content: DisplayContent::Markdown(
-                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/uncompact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/memory [search|add|candidate|confirm|edit|delete]` `/diff`\n`/plan` `/build` `/explore` `/cluster` `/model` `/provider` `/agent`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell\n\n搜索后端（DuckDuckGo/Bing）来自 config 的 [runtime].search_backend，TUI 不另存配置"
+                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/uncompact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/memory [search|add|candidate|confirm|edit|delete]` `/diff`\n`/plan` `/build` `/explore` `/cluster` `/model` `/provider` `/agent`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell\n\n页脚选择器（也可点击页脚标签）：Alt+P 供应商 | Alt+M 模型 | Alt+T 思考强度\n↑/↓ 选择 | ←/→ 切换强度与预算列 | Enter 应用 | Esc 取消 | r 刷新模型\n\n搜索后端（DuckDuckGo/Bing）来自 config 的 [runtime].search_backend，TUI 不另存配置"
                             .into(),
                     ),
                 });
