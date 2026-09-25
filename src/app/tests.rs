@@ -4,6 +4,21 @@ use protium_core::provider::ToolCall;
 use ratatui::backend::TestBackend;
 use tempfile::tempdir;
 
+#[test]
+fn child_progress_phase_and_old_running_events_are_distinguished_from_queued() {
+    use protium_core::agent::ChildSessionStatus as Status;
+
+    assert_eq!(
+        child_status_from_wire("running", Some("queued")),
+        Status::Queued
+    );
+    assert_eq!(
+        child_status_from_wire("running", Some("waiting_approval")),
+        Status::WaitingApproval
+    );
+    assert_eq!(child_status_from_wire("running", None), Status::Running);
+}
+
 async fn test_app() -> (App, tempfile::TempDir) {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path().join("ws");

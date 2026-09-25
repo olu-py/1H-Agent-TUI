@@ -129,6 +129,7 @@ pub(super) fn session_summary(session: &protium_core::protocol::SessionStateDto)
         id: session.id.clone(),
         title: session.title.clone(),
         parent_id: session.parent_id.clone(),
+        child_status: session.child_status.clone(),
     }
 }
 
