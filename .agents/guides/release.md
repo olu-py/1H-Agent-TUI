@@ -17,7 +17,7 @@
 - 兼容性由本仓库锁定的 core commit、`PROTOCOL_VERSION` 和 conformance 测试共同确认；core 与 TUI 版本号不要求相同。
 - 本地联调允许命令行 path patch；发布前必须移除 patch，禁止提交 path dependency、临时 Cargo 配置或 path 锁文件。
 - core 必须先 push；本仓库再定向更新 core、完成 TUI 适配并提交 `Cargo.lock`。TUI tag/release 不隐含发布 core 或其他消费端。
-- 先提交并推送 main、核对远端 SHA，再建 tag；notes 文件必须是 `.github/release-notes/vX.Y.Z.md`。
+- 先按 Push workflow 通过 PR 合并到 main、核对远端 SHA，再建 tag；notes 文件必须是 `.github/release-notes/vX.Y.Z.md`。
 - 权威流程：版本校验 -> 三平台验证 -> 四目标归档和安装包 -> checksums -> GitHub Release。
 - 归档保留 README、LICENSE、第三方声明和示例配置；Release 包含归档、DEB、MSI、checksums 和 notices。
 - 不假定本机有 `gh`；凭据不得进入命令、文件、日志或回复，Actions 使用最小权限 token。
