@@ -37,6 +37,7 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 | 会话、分支、迁移、持久化 | `protium-core (Git dependency): src/storage.rs`、`session.rs` | [Storage](.agents/guides/storage.md)；涉及 Provider 状态时再读 Provider |
 | 配置上限、容量归一化、新增配置键 | `protium-core (Git dependency): src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算、`max_output_tokens`、未知模型窗口语义）；同步默认值与 `defaults_are_bounded` 类测试 |
 | CI、版本、安装包、tag | `.github/workflows/`、`Cargo.toml` | [Release](.agents/guides/release.md) |
+| 功能分支、PR 合并、`main` 同步与跨仓库 core 更新 | Git 分支、锁文件与 CI 状态 | [Push workflow](.agents/guides/push-workflow.md)；使用项目 Skill [`git-pr-local-sync`](.agents/skills/git-pr-local-sync/SKILL.md) |
 
 指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。
 

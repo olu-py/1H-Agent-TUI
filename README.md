@@ -171,7 +171,7 @@ native_web_search = "disabled"
 
 ## AI 维护文档
 
-维护或开发本项目的 AI Agent 请先读取 [AGENTS.md](AGENTS.md)，再按任务路由只加载相关专题指南。该入口提供架构、源码路由、安全边界和分级验证规则。
+维护或开发本项目的 AI Agent 请先读取 [AGENTS.md](AGENTS.md)，再按任务路由只加载相关专题指南。提交、推送、PR 合并和本地同步可使用项目 Skill [`git-pr-local-sync`](.agents/skills/git-pr-local-sync/SKILL.md)，或阅读 [Push workflow](.agents/guides/push-workflow.md)。该入口提供架构、源码路由、安全边界和分级验证规则。
 
 ## 第三方声明
 
