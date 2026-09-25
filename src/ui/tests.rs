@@ -155,16 +155,19 @@ fn flatten_session_tree_defaults_collapsed_only_click_expands() {
             id: "root".into(),
             title: "Root".into(),
             parent_id: None,
+            child_status: None,
         },
         SessionSummary {
             id: "other".into(),
             title: "Other".into(),
             parent_id: None,
+            child_status: None,
         },
         SessionSummary {
             id: "child".into(),
             title: "Child".into(),
             parent_id: Some("root".into()),
+            child_status: None,
         },
     ];
     // Default: nothing explicitly expanded -> everything collapsed.

@@ -1055,11 +1055,13 @@ mod tests {
                     id: "one".into(),
                     title: "第一个会话".into(),
                     parent_id: None,
+                    child_status: None,
                 },
                 SessionSummary {
                     id: "two".into(),
                     title: "second".into(),
                     parent_id: None,
+                    child_status: None,
                 },
             ],
         )

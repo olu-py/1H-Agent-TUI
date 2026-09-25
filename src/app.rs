@@ -677,6 +677,7 @@ fn handle_envelope(app: &mut App, envelope: &Envelope) -> bool {
         ProtocolEvent::ChildSessionProgress {
             child_session_id,
             status,
+            phase,
             turn,
             max_turns,
             tool,
@@ -684,7 +685,7 @@ fn handle_envelope(app: &mut App, envelope: &Envelope) -> bool {
             app.child_status.insert(
                 child_session_id.clone(),
                 ChildSessionProgress {
-                    status: child_status_from_wire(status),
+                    status: child_status_from_wire(status, phase.as_deref()),
                     turn: *turn,
                     max_turns: *max_turns,
                     tool: tool.clone(),
@@ -769,6 +770,21 @@ impl App {
         self.current
             .sync_partial(snapshot.assistant_partial.as_ref());
         self.sessions = snapshot.sessions.iter().map(session_summary).collect();
+        self.child_status.clear();
+        for session in &snapshot.sessions {
+            if let Some(status) = &session.child_status {
+                self.child_status.insert(
+                    session.id.clone(),
+                    ChildSessionProgress {
+                        status: child_status_from_wire(status, session.child_phase.as_deref()),
+                        turn: session.child_turn.unwrap_or_default(),
+                        max_turns: session.child_max_turns.unwrap_or_default(),
+                        tool: session.child_tool.clone(),
+                        updated_at: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
         self.approval = snapshot.approval.as_ref().map(approval_display);
         self.current.todos = snapshot
             .todos
@@ -878,14 +894,29 @@ impl App {
     }
 }
 
-fn child_status_from_wire(status: &str) -> protium_core::agent::ChildSessionStatus {
+fn child_status_from_wire(
+    status: &str,
+    phase: Option<&str>,
+) -> protium_core::agent::ChildSessionStatus {
+    use protium_core::agent::ChildSessionStatus as Status;
+    if status == "running" {
+        return match phase {
+            Some("queued") => Status::Queued,
+            Some("waiting_model") => Status::WaitingModel,
+            Some("streaming") => Status::Streaming,
+            Some("running_tool") => Status::RunningTool,
+            Some("waiting_approval_slot") => Status::WaitingApprovalSlot,
+            Some("waiting_approval") => Status::WaitingApproval,
+            _ => Status::Running,
+        };
+    }
     match status {
-        "completed" => protium_core::agent::ChildSessionStatus::Completed,
-        "failed" => protium_core::agent::ChildSessionStatus::Failed,
-        "turn_limit" => protium_core::agent::ChildSessionStatus::TurnLimit,
-        "timed_out" => protium_core::agent::ChildSessionStatus::TimedOut,
-        "cancelled" => protium_core::agent::ChildSessionStatus::Cancelled,
-        _ => protium_core::agent::ChildSessionStatus::Queued,
+        "completed" => Status::Completed,
+        "failed" => Status::Failed,
+        "turn_limit" => Status::TurnLimit,
+        "timed_out" => Status::TimedOut,
+        "cancelled" => Status::Cancelled,
+        _ => Status::Running,
     }
 }
 
