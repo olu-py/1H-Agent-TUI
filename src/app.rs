@@ -25,8 +25,7 @@ use protium_core::{
     agent::ChildSessionProgress,
     commands::{self, AgentMode, Command, TodoCommand},
     config::{
-        Config, ProviderKind, ProviderPreset, ThinkingLevel, ThinkingProfile, ThinkingProfileKind,
-        thinking_profile,
+        Config, ProviderKind, ProviderPreset, ThinkingLevel, ThinkingProfile, thinking_profile,
     },
     protocol::{
         AppSnapshotV2, ApprovalDto, Envelope, Event as ProtocolEvent, ProviderModelDto,
@@ -46,6 +45,7 @@ use crate::{
     output::{EdgeScroll, InteractionTarget, OutputSelection},
     projection::{ApprovalDisplay, TuiSessionProjection},
     ui,
+    ui_layout::PickerGeometry,
 };
 
 #[path = "app/commands.rs"]
@@ -67,10 +67,8 @@ use event_loop::{build_app, should_coalesce_stream_redraw};
 use event_loop::{parse_phase, session_summary};
 use input::handle_terminal_event;
 use provider::{
-    apply_model_refresh_result, apply_thinking_selection, handle_model_menu_key,
-    handle_model_mouse, handle_provider_menu_key, handle_provider_mouse, load_provider_models,
-    model_menu_key_handled, point_in_rect, provider_menu_key_handled, refresh_provider_settings,
-    thinking_menu_selection,
+    FooterMenu, apply_model_refresh_result, handle_footer_menu_key, handle_footer_mouse,
+    load_provider_models, open_footer_menu, point_in_rect, refresh_provider_settings,
 };
 pub(crate) use provider::{model_choices, provider_choices};
 use settings::{
@@ -86,6 +84,29 @@ pub use protium_core::model::{
     ThinkingDisplay, ThinkingResult, TodoDisplay, TodoStatus, TodoTask, ToolDisplay,
     ToolDisplayStatus,
 };
+
+/// Keyboard cursor inside the thinking picker: which painted row, and which
+/// column (`0` = thinking level, `1` = Qwen3.7 token budget). It is clamped
+/// against the live table before use, so a cursor left over from another
+/// provider's profile can never address a cell that is not painted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThinkingMenuCursor {
+    pub row: usize,
+    pub column: usize,
+}
+
+impl ThinkingMenuCursor {
+    /// Wraps the cursor into a `rows` x `columns` table.
+    pub(crate) fn clamped(self, rows: usize, columns: usize) -> Self {
+        if rows == 0 || columns == 0 {
+            return Self::default();
+        }
+        Self {
+            row: self.row.min(rows - 1),
+            column: self.column.min(columns - 1),
+        }
+    }
+}
 
 /// How the user answered a pending approval prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,16 +213,17 @@ pub struct App {
     pub palette: Option<CommandPaletteState>,
     pub thinking_menu_open: bool,
     pub thinking_control_rect: Option<Rect>,
-    pub thinking_menu_rect: Option<Rect>,
+    pub thinking_menu_geometry: Option<PickerGeometry>,
+    pub thinking_menu_cursor: ThinkingMenuCursor,
     pub session_panel_rect: Option<Rect>,
     pub input_mode_rect: Option<Rect>,
     pub provider_control_rect: Option<Rect>,
     pub model_control_rect: Option<Rect>,
     pub provider_menu_open: bool,
-    pub provider_menu_rect: Option<Rect>,
+    pub provider_menu_geometry: Option<PickerGeometry>,
     pub provider_menu_selected: usize,
     pub model_menu_open: bool,
-    pub model_menu_rect: Option<Rect>,
+    pub model_menu_geometry: Option<PickerGeometry>,
     pub model_menu_selected: usize,
     pub todo_window_rect: Option<Rect>,
     pub force_full_redraw: bool,

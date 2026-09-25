@@ -30,10 +30,11 @@ use crate::{
     secrets,
     settings::{FIELDS, SettingsField, SettingsForm, SettingsState},
     storage::SessionSummary,
-    ui_layout::{Density, HeightClass, compute_layout, message_block},
+    ui_layout::{Density, HeightClass, PickerGeometry, compute_layout, message_block},
     ui_theme::{UiTheme, VisualRole},
     ui_view_model::{
-        FooterLine, InputView, ThinkingControlView, UiSegment, UiViewModel, mode_label,
+        FooterLine, InputView, THINKING_LEVEL_COLUMN_WIDTH, ThinkingControlView, UiSegment,
+        UiViewModel, mode_label, thinking_menu_rows,
     },
 };
 
@@ -78,17 +79,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.thinking_menu_open {
         draw_thinking_menu(frame, area, layout.footer, app, &view.thinking, &theme);
     } else {
-        app.thinking_menu_rect = None;
+        app.thinking_menu_geometry = None;
     }
     if app.provider_menu_open {
         draw_provider_menu(frame, area, layout.footer, app, &theme);
     } else {
-        app.provider_menu_rect = None;
+        app.provider_menu_geometry = None;
     }
     if app.model_menu_open {
         draw_model_menu(frame, area, layout.footer, app, &theme);
     } else {
-        app.model_menu_rect = None;
+        app.model_menu_geometry = None;
     }
     app.settings_rect = app.settings.as_ref().map(|settings| match settings {
         SettingsState::List(_) => centered_rect(78, 20, area),

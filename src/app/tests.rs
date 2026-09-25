@@ -3,6 +3,7 @@ use protium_core::config::Config;
 use protium_core::provider::ToolCall;
 use ratatui::backend::TestBackend;
 use tempfile::tempdir;
+use unicode_width::UnicodeWidthStr;
 
 #[test]
 fn child_progress_phase_and_old_running_events_are_distinguished_from_queued() {
@@ -503,4 +504,435 @@ fn session_switch_direction_only_accepts_alt_or_ctrl_arrows() {
         crossterm::event::KeyModifiers::CONTROL,
     );
     assert_eq!(session_switch_direction(&ctrl_down), Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// Footer pickers: provider, model and thinking level.
+//
+// Every picker is painted from a row window (`PickerGeometry`) and the mouse
+// hit-test resolves the same window, so these tests compare what the frame
+// actually shows with what a click on that row applies.
+// ---------------------------------------------------------------------------
+
+fn picker_click(column: u16, row: u16) -> Event {
+    Event::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn picker_key(code: KeyCode) -> Event {
+    Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn picker_key_with(code: KeyCode, modifiers: KeyModifiers) -> Event {
+    Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
+}
+
+fn picker_row(terminal: &Terminal<TestBackend>, row: u16, from: u16, to: u16) -> String {
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    let mut column = from;
+    while column < to {
+        let symbol = buffer[(column, row)].symbol();
+        let width = UnicodeWidthStr::width(symbol);
+        text.push_str(symbol);
+        // A double-width glyph owns the cell after it, and that half-cell keeps
+        // whatever was painted under the popup, so it is skipped rather than
+        // read back as row content.
+        column += 1.max(width as u16);
+    }
+    text
+}
+
+fn saved_provider_settings(presets: &[&str]) -> ProviderSettingsDto {
+    let profiles = presets
+        .iter()
+        .map(|preset| ProviderProfileDto {
+            preset: (*preset).to_owned(),
+            kind: "chat_completions".into(),
+            model: format!("{preset}-model"),
+            base_url: "https://example.invalid/v1".into(),
+        })
+        .collect::<Vec<_>>();
+    ProviderSettingsDto {
+        active: profiles[0].clone(),
+        saved: profiles.clone(),
+        connected: vec![profiles[0].preset.clone()],
+    }
+}
+
+fn listed_models(count: usize) -> ProviderModelsState {
+    ProviderModelsState {
+        preset: Some(ProviderPreset::OpenAi),
+        models: (0..count)
+            .map(|index| ProviderModelDto {
+                id: format!("model-{index:02}"),
+                context_window_tokens: None,
+                max_output_tokens: None,
+            })
+            .collect(),
+        fetched_at: None,
+        loading: false,
+        last_error: None,
+    }
+}
+
+#[tokio::test]
+async fn thinking_picker_is_operable_from_the_keyboard() {
+    let (mut app, _temp) = test_app().await;
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let initial = app.thinking_level();
+    let active = app
+        .thinking_profile()
+        .options
+        .iter()
+        .position(|level| *level == initial)
+        .expect("active level is offered");
+
+    // Alt+T opens the picker without a mouse and parks the cursor on the level
+    // that is applied today.
+    handle_terminal_event(
+        &mut app,
+        picker_key_with(KeyCode::Char('t'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open thinking picker");
+    assert!(app.thinking_menu_open, "Alt+T must open the picker");
+    assert_eq!(app.thinking_menu_cursor.row, active);
+
+    // Down navigates instead of dismissing, Enter applies.
+    handle_terminal_event(&mut app, picker_key(KeyCode::Down))
+        .await
+        .expect("down");
+    assert!(app.thinking_menu_open, "navigation keeps the picker open");
+    assert_eq!(app.thinking_menu_cursor.row, active + 1);
+    handle_terminal_event(&mut app, picker_key(KeyCode::Enter))
+        .await
+        .expect("enter");
+    assert!(!app.thinking_menu_open);
+    assert_eq!(
+        app.thinking_level(),
+        ThinkingLevel::None,
+        "the highlighted row is what got applied"
+    );
+
+    // Esc closes without applying anything.
+    let applied = app.thinking_level();
+    handle_terminal_event(
+        &mut app,
+        picker_key_with(KeyCode::Char('t'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("reopen");
+    handle_terminal_event(&mut app, picker_key(KeyCode::Up))
+        .await
+        .expect("up");
+    handle_terminal_event(&mut app, picker_key(KeyCode::Esc))
+        .await
+        .expect("esc");
+    assert!(!app.thinking_menu_open);
+    assert_eq!(
+        app.thinking_level(),
+        applied,
+        "Esc must not apply the cursor"
+    );
+
+    // A key the picker does not use dismisses it, so the composer stays usable.
+    handle_terminal_event(
+        &mut app,
+        picker_key_with(KeyCode::Char('t'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("reopen");
+    // The OpenAI profile offers a single column: ←/→ must not underflow the
+    // cursor out of it, and must not dismiss the picker either.
+    let before = app.thinking_menu_cursor;
+    handle_terminal_event(&mut app, picker_key(KeyCode::Left))
+        .await
+        .expect("left");
+    handle_terminal_event(&mut app, picker_key(KeyCode::Right))
+        .await
+        .expect("right");
+    assert!(app.thinking_menu_open, "column keys keep the picker open");
+    assert_eq!(app.thinking_menu_cursor.row, before.row);
+    assert_eq!(
+        app.thinking_menu_cursor.column, 0,
+        "there is no second column to move to"
+    );
+    handle_terminal_event(&mut app, picker_key(KeyCode::Char('z')))
+        .await
+        .expect("dismiss");
+    assert!(!app.thinking_menu_open);
+}
+
+#[tokio::test]
+async fn thinking_picker_clicks_the_cell_it_renders() {
+    let (mut app, _temp) = test_app().await;
+    app.config.provider.preset = ProviderPreset::Qwen;
+    app.config.provider.model = "qwen37-max".into();
+    app.config.provider.thinking_level = ThinkingLevel::Enabled;
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let control = app.thinking_control_rect.expect("thinking control");
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("open");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let picker = app.thinking_menu_geometry.expect("thinking geometry");
+    let inner = picker.inner();
+    let columns = crate::ui_view_model::thinking_menu_columns(&app);
+    assert_eq!(
+        columns.len(),
+        2,
+        "the Qwen3.7 profile paints a level and a budget column"
+    );
+    assert!(
+        picker.visible >= 6,
+        "the picker paints every budget row: {picker:?}"
+    );
+    let level_width = crate::ui_view_model::THINKING_LEVEL_COLUMN_WIDTH;
+    for row in inner.y..inner.bottom() {
+        let index = picker.scroll + usize::from(row - inner.y);
+        let text = picker_row(&terminal, row, inner.x, inner.right());
+        for (column, anchor) in [(0usize, inner.x), (1usize, inner.x + level_width)] {
+            let painted = columns[column].cells.get(index);
+            let resolved = crate::app::provider::thinking_menu_selection(&app, picker, anchor, row);
+            match (painted, resolved) {
+                (Some(cell), Some(hit)) => {
+                    assert_eq!(
+                        hit.label, cell.label,
+                        "row {row} paints {text:?} but the click resolves another cell"
+                    );
+                    assert!(
+                        text.contains(&cell.label),
+                        "row {row} column {column} resolves {} but is not painted there",
+                        cell.label
+                    );
+                }
+                (None, None) => {}
+                (painted, resolved) => panic!(
+                    "row {row} column {column} paints {:?} and resolves {:?}",
+                    painted.map(|cell| &cell.label),
+                    resolved.map(|cell| cell.label)
+                ),
+            }
+        }
+    }
+
+    // Left of the level column and right of the budget column resolve nothing,
+    // so a click beside the table can not apply a thinking setting.
+    assert!(
+        crate::app::provider::thinking_menu_selection(&app, picker, inner.x - 1, inner.y).is_none()
+    );
+
+    // ←/→ switch columns; Enter applies the row the cursor is highlighted on.
+    handle_terminal_event(&mut app, picker_key(KeyCode::Right))
+        .await
+        .expect("right");
+    assert_eq!(app.thinking_menu_cursor.column, 1);
+    assert!(
+        app.thinking_menu_open,
+        "switching columns keeps the picker open"
+    );
+    handle_terminal_event(&mut app, picker_key(KeyCode::Down))
+        .await
+        .expect("down");
+    let row = app.thinking_menu_cursor.row;
+    let expected = columns[1].cells[row].budget;
+    assert!(
+        expected.is_some(),
+        "the cursor moved onto a real budget row"
+    );
+    handle_terminal_event(&mut app, picker_key(KeyCode::Enter))
+        .await
+        .expect("enter");
+    assert!(!app.thinking_menu_open);
+    assert_eq!(
+        app.thinking_budget_tokens(),
+        expected,
+        "Enter applies the highlighted budget"
+    );
+    assert_eq!(app.thinking_level(), ThinkingLevel::Enabled);
+}
+
+#[tokio::test]
+async fn provider_picker_rows_map_to_the_rendered_provider() {
+    let (mut app, _temp) = test_app().await;
+    let fake = saved_provider_settings(&["openai", "deepseek", "qwen", "volcano", "custom"]);
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let control = app.provider_control_rect.expect("provider control");
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("open");
+    // Opening re-reads the core view, so the multi-provider list is seeded
+    // afterwards: the picker must paint and resolve the same rows.
+    app.provider_settings = Some(fake);
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let picker = app.provider_menu_geometry.expect("provider geometry");
+    let inner = picker.inner();
+    assert_eq!(
+        app.provider_menu_selected, 0,
+        "the cursor starts on the active provider, not on a stale index"
+    );
+    for row in inner.y..inner.bottom() {
+        let text = picker_row(&terminal, row, inner.x, inner.right());
+        let preset = crate::app::provider::provider_menu_selection(&app, picker, inner.x + 2, row)
+            .unwrap_or_else(|| panic!("row {row} paints {text:?} but resolves no provider"));
+        assert!(
+            text.contains(preset.label()),
+            "row {row} paints {text:?} but the click resolves {}",
+            preset.label()
+        );
+    }
+
+    // Keyboard: Down moves the visible cursor, Esc dismisses without applying.
+    handle_terminal_event(&mut app, picker_key(KeyCode::Down))
+        .await
+        .expect("down");
+    assert_eq!(app.provider_menu_selected, 1);
+    handle_terminal_event(&mut app, picker_key(KeyCode::Esc))
+        .await
+        .expect("esc");
+    assert!(!app.provider_menu_open);
+    assert_eq!(app.active_preset(), ProviderPreset::OpenAi);
+
+    // A click outside the painted frame only dismisses.
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("reopen");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let picker = app.provider_menu_geometry.expect("provider geometry");
+    handle_terminal_event(&mut app, picker_click(picker.area.right(), picker.area.y))
+        .await
+        .expect("click outside");
+    assert!(!app.provider_menu_open);
+    assert_eq!(app.active_preset(), ProviderPreset::OpenAi);
+}
+
+#[tokio::test]
+async fn model_picker_click_hits_the_rendered_row_when_scrolled() {
+    let (mut app, _temp) = test_app().await;
+    let backend = TestBackend::new(100, 16);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let control = app.model_control_rect.expect("model control");
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("open");
+    // A 20-model list only exists after the cache-only read, so it is seeded
+    // here: the window has to scroll, which is where the old hit-test drifted.
+    app.provider_models = listed_models(20);
+    app.model_menu_selected = 17;
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let picker = app.model_menu_geometry.expect("scrolled geometry");
+    let inner = picker.inner();
+    assert!(
+        picker.visible < 20 && picker.scroll > 0,
+        "the window must actually scroll for this to be a regression test: {picker:?}"
+    );
+    assert!(
+        picker.area.bottom() <= inner.y + inner.height + 2 && picker.visible <= 20,
+        "the popup keeps its rows inside the screen: {picker:?}"
+    );
+    for row in inner.y..inner.bottom() {
+        let text = picker_row(&terminal, row, inner.x, inner.right());
+        let model = crate::app::provider::model_menu_selection(&app, picker, inner.x + 1, row)
+            .unwrap_or_else(|| panic!("row {row} paints {text:?} but resolves no model"));
+        assert!(
+            text.contains(&model),
+            "row {row} paints {text:?} but the click resolves {model}"
+        );
+    }
+
+    // Keyboard navigation wraps inside the list and reels a stale cursor back
+    // onto it, so Enter never addresses a row that is not painted (an aborted
+    // process is what an out-of-range index costs in the release profile).
+    let count = crate::app::model_choices(&app).len();
+    assert!(count > 3, "the seeded list is long enough to wrap: {count}");
+    app.model_menu_selected = count + 80;
+    handle_terminal_event(&mut app, picker_key(KeyCode::Down))
+        .await
+        .expect("down with a stale cursor");
+    assert_eq!(
+        app.model_menu_selected,
+        count - 1,
+        "the stale cursor lands on the last painted row"
+    );
+    handle_terminal_event(&mut app, picker_key(KeyCode::Up))
+        .await
+        .expect("up");
+    assert_eq!(app.model_menu_selected, count - 2);
+    handle_terminal_event(&mut app, picker_key(KeyCode::Down))
+        .await
+        .expect("down again");
+    assert_eq!(
+        app.model_menu_selected,
+        count - 1,
+        "an in-range cursor moves normally"
+    );
+    handle_terminal_event(&mut app, picker_key(KeyCode::Down))
+        .await
+        .expect("wrap");
+    assert_eq!(
+        app.model_menu_selected, 0,
+        "navigation wraps inside the list"
+    );
+    handle_terminal_event(&mut app, picker_key(KeyCode::Esc))
+        .await
+        .expect("esc");
+    assert!(!app.model_menu_open);
+}
+
+#[tokio::test]
+async fn provider_picker_enter_clamps_a_stale_cursor() {
+    let (mut app, _temp) = test_app().await;
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let control = app.provider_control_rect.expect("provider control");
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("open");
+    app.provider_settings = Some(saved_provider_settings(&["openai", "deepseek"]));
+    app.provider_menu_selected = 99;
+    handle_terminal_event(&mut app, picker_key(KeyCode::Enter))
+        .await
+        .expect("enter with a stale cursor");
+    assert!(!app.provider_menu_open, "Enter closes the picker");
+    assert_eq!(
+        app.active_preset(),
+        ProviderPreset::OpenAi,
+        "no key for the target provider means no switch"
+    );
+    assert!(
+        app.current.status.contains("DeepSeek"),
+        "the highlighted row is what was requested: {}",
+        app.current.status
+    );
 }

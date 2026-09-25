@@ -121,43 +121,52 @@ pub(super) fn draw_provider_menu(
     theme: &UiTheme,
 ) {
     let choices = crate::app::provider_choices(app);
-    let content_width = choices
+    // Each row is formatted once (label column plus key state) and the widest
+    // row sizes the popup, so painted text and hit-tested text cannot disagree
+    // while the frame still grows upward from its own footer control.
+    let rows = choices
         .iter()
-        .map(|preset| UnicodeWidthStr::width(preset.label()))
-        .max()
-        .unwrap_or(12)
-        .saturating_add(4) as u16;
-    let width = content_width.clamp(20, 36).min(screen.width);
-    let height = (choices.len() as u16).saturating_add(2).min(screen.height);
-    let control = app
-        .provider_control_rect
-        .unwrap_or(Rect::new(footer.x, footer.y, 0, 0));
-    let x = control.x.min(screen.right().saturating_sub(width));
-    let y = footer.y.saturating_sub(height);
-    let area = Rect::new(x, y, width, height);
-    app.provider_menu_rect = Some(area);
-
-    let items = choices
-        .iter()
-        .enumerate()
-        .map(|(index, preset)| {
-            let selected = index == app.provider_menu_selected;
+        .map(|preset| {
             let connected = app
                 .provider_settings
                 .as_ref()
                 .is_some_and(|settings| settings.connected.iter().any(|id| id == preset.key_id()));
-            let status = if connected {
-                "已连接"
-            } else {
-                "需要 API Key"
-            };
+            format!(
+                "{:<14} {}",
+                preset.label(),
+                if connected {
+                    "已连接"
+                } else {
+                    "需要 API Key"
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let content_width = rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .max()
+        .unwrap_or(18)
+        .saturating_add(3) as u16;
+    let width = content_width.clamp(20, 40).min(screen.width);
+    let control = app
+        .provider_control_rect
+        .unwrap_or(Rect::new(footer.x, footer.y, 0, 0));
+    let selected = app
+        .provider_menu_selected
+        .min(choices.len().saturating_sub(1));
+    let picker = PickerGeometry::new(screen, footer, control.x, width, choices.len(), selected);
+    app.provider_menu_geometry = Some(picker);
+    let items = rows
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(picker.visible)
+        .map(|(index, row)| {
+            let active = index == selected;
             ListItem::new(Line::from(Span::styled(
-                format!(
-                    "{} {:<18} {status}",
-                    if selected { "›" } else { " " },
-                    preset.label()
-                ),
-                if selected {
+                format!("{} {}", if active { "›" } else { " " }, row),
+                if active {
                     theme.selected
                 } else {
                     theme.style(VisualRole::Primary)
@@ -165,15 +174,15 @@ pub(super) fn draw_provider_menu(
             )))
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Clear, area);
+    frame.render_widget(Clear, picker.area);
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title(" 选择供应商 ")
+                .title(" 选择供应商 ↑↓ Enter Esc ")
                 .borders(Borders::ALL)
                 .border_style(theme.focus_border),
         ),
-        area,
+        picker.area,
     );
 }
 
@@ -185,39 +194,33 @@ pub(super) fn draw_model_menu(
     theme: &UiTheme,
 ) {
     let choices = crate::app::model_choices(app);
-    let content_width = choices
+    let labels = choices
         .iter()
-        .map(|choice| UnicodeWidthStr::width(choice.label.as_str()))
+        .map(|choice| choice.label.as_str())
+        .collect::<Vec<_>>();
+    let content_width = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(*label))
         .max()
         .unwrap_or(12)
-        .saturating_add(4) as u16;
-    let width = content_width.clamp(24, 52).min(screen.width);
-    let height = (choices.len() as u16)
-        .saturating_add(2)
-        .min(14)
-        .min(screen.height);
+        .saturating_add(3) as u16;
+    let width = content_width.clamp(22, 52).min(screen.width);
     let control = app
         .model_control_rect
         .unwrap_or(Rect::new(footer.x, footer.y, 0, 0));
-    let x = control.x.min(screen.right().saturating_sub(width));
-    let y = footer.y.saturating_sub(height);
-    let area = Rect::new(x, y, width, height);
-    app.model_menu_rect = Some(area);
-
-    let visible = area.height.saturating_sub(2) as usize;
-    let scroll = app
-        .model_menu_selected
-        .saturating_sub(visible.saturating_sub(1));
-    let items = choices
+    let selected = app.model_menu_selected.min(choices.len().saturating_sub(1));
+    let picker = PickerGeometry::new(screen, footer, control.x, width, choices.len(), selected);
+    app.model_menu_geometry = Some(picker);
+    let items = labels
         .iter()
         .enumerate()
-        .skip(scroll)
-        .take(visible)
-        .map(|(index, choice)| {
-            let selected = index == app.model_menu_selected;
+        .skip(picker.scroll)
+        .take(picker.visible)
+        .map(|(index, label)| {
+            let active = index == selected;
             ListItem::new(Line::from(Span::styled(
-                format!("{} {}", if selected { "›" } else { " " }, choice.label),
-                if selected {
+                format!("{} {}", if active { "›" } else { " " }, label),
+                if active {
                     theme.selected
                 } else {
                     theme.style(VisualRole::Primary)
@@ -232,15 +235,18 @@ pub(super) fn draw_model_menu(
     } else {
         ""
     };
-    frame.render_widget(Clear, area);
+    frame.render_widget(Clear, picker.area);
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title(format!(" {} 模型 · r 刷新{status} ", app.provider_label()))
+                .title(format!(
+                    " {} 模型 · r 刷新{status} ↑↓ Enter ",
+                    app.provider_label()
+                ))
                 .borders(Borders::ALL)
                 .border_style(theme.focus_border),
         ),
-        area,
+        picker.area,
     );
 }
 
@@ -267,65 +273,104 @@ pub(super) fn draw_thinking_menu(
     view: &ThinkingControlView,
     theme: &UiTheme,
 ) {
-    let rows = view
-        .options
-        .len()
-        .max(if view.qwen37_budgets { 6 } else { 0 });
-    let width = if view.qwen37_budgets { 28 } else { 18 }.min(screen.width);
-    let height = (rows as u16).saturating_add(2).min(screen.height);
+    let rows = thinking_menu_rows(&view.columns);
+    let levels = view.columns.first().map_or(&[][..], |column| &column.cells);
+    let budgets = view.columns.get(1).map_or(&[][..], |column| &column.cells);
+    // A row is the level cell padded to exactly the column width the hit-test
+    // splits on, followed by the Qwen3.7 budget cell. Deriving the text once
+    // for the width and again for the spans keeps painter and hit-test in
+    // lockstep instead of approximating the same layout twice.
+    let parts = (0..rows)
+        .map(|index| {
+            let level = levels.get(index).map_or(String::new(), |cell| {
+                format!("{} {}", if cell.active { "●" } else { "○" }, cell.label)
+            });
+            let budget = budgets.get(index).map_or(String::new(), |cell| {
+                format!(" {} {}", if cell.active { "●" } else { "○" }, cell.label)
+            });
+            (level, budget)
+        })
+        .collect::<Vec<_>>();
+    let content_width = parts
+        .iter()
+        .map(|(level, budget)| {
+            UnicodeWidthStr::width(pad_cells(level, THINKING_LEVEL_COLUMN_WIDTH).as_str())
+                + UnicodeWidthStr::width(budget.as_str())
+        })
+        .max()
+        .unwrap_or(14)
+        .saturating_add(3) as u16;
+    let width = content_width.clamp(16, 30).min(screen.width);
     let control = app
         .thinking_control_rect
         .unwrap_or(Rect::new(footer.x, footer.y, 0, 0));
-    let x = control
-        .right()
-        .saturating_sub(width)
-        .min(screen.right().saturating_sub(width));
-    let y = footer.y.saturating_sub(height);
-    let area = Rect::new(x, y, width, height);
-    app.thinking_menu_rect = Some(area);
-
-    let mut lines = Vec::with_capacity(rows);
-    for index in 0..rows {
-        let left = view.options.get(index).map_or_else(String::new, |item| {
-            format!("{} {}", if item.selected { "●" } else { "○" }, item.label)
-        });
-        let text = if view.qwen37_budgets {
-            const BUDGETS: [(Option<u32>, &str); 6] = [
-                (None, "默认"),
-                (Some(1024), "1k"),
-                (Some(4096), "4k"),
-                (Some(8192), "8k"),
-                (Some(16384), "16k"),
-                (Some(32768), "32k"),
-            ];
-            let (budget, label) = BUDGETS.get(index).copied().unwrap_or((None, ""));
-            format!(
-                "{left:<8} {} {label}",
-                if view.budget_tokens == budget
-                    && app.thinking_level() == crate::config::ThinkingLevel::Enabled
-                {
-                    "●"
-                } else {
-                    "○"
-                }
-            )
-        } else {
-            left
-        };
-        lines.push(Line::from(Span::styled(
-            text,
-            theme.style(VisualRole::Primary),
-        )));
-    }
-    frame.render_widget(Clear, area);
+    let cursor = app
+        .thinking_menu_cursor
+        .clamped(rows, view.columns.len().max(1));
+    let picker = PickerGeometry::new(
+        screen,
+        footer,
+        control.right().saturating_sub(width),
+        width,
+        rows,
+        cursor.row,
+    );
+    app.thinking_menu_geometry = Some(picker);
+    let plain = theme.style(VisualRole::Primary);
+    let lines = (picker.scroll..picker.scroll.saturating_add(picker.visible))
+        .filter_map(|index| parts.get(index).map(|part| (index, part)))
+        .map(|(index, (level, budget))| {
+            Line::from(vec![
+                Span::styled(
+                    pad_cells(level, THINKING_LEVEL_COLUMN_WIDTH),
+                    if cursor.column == 0 && cursor.row == index {
+                        theme.selected
+                    } else {
+                        plain
+                    },
+                ),
+                Span::styled(
+                    budget.clone(),
+                    if cursor.column == 1 && cursor.row == index {
+                        theme.selected
+                    } else {
+                        plain
+                    },
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, picker.area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(" 思考强度 ")
+                .title(if budgets.is_empty() {
+                    " 思考强度 ↑↓ Enter Esc "
+                } else {
+                    " 思考强度 ↑↓←→ Enter Esc "
+                })
                 .border_style(theme.style(VisualRole::Accent)),
         ),
-        area,
+        picker.area,
     );
+}
+
+/// Pads or truncates `text` to exactly `width` terminal cells so the column
+/// after it starts where the picker hit-test expects.
+fn pad_cells(text: &str, width: u16) -> String {
+    let budget = usize::from(width);
+    let mut output = String::new();
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if used + grapheme_width > budget {
+            break;
+        }
+        output.push_str(grapheme);
+        used += grapheme_width;
+    }
+    output.push_str(&" ".repeat(budget - used));
+    output
 }
 
 fn footer_line(view: &FooterLine, width: usize, theme: &UiTheme) -> Line<'static> {
