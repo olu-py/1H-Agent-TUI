@@ -48,10 +48,10 @@ async fn test_app() -> (App, tempfile::TempDir) {
 #[tokio::test]
 async fn model_refresh_channel_is_bounded_to_one_result() {
     let (app, _temp) = test_app().await;
-    let preset = app.active_preset();
+    let provider_id = app.active_provider_id();
     let result = || ModelRefreshResult {
         generation: 1,
-        preset,
+        provider_id: provider_id.clone(),
         result: Err("test".to_owned()),
     };
 
@@ -64,13 +64,13 @@ async fn stale_model_refresh_does_not_clear_newer_loading_state() {
     let (mut app, _temp) = test_app().await;
     app.model_refresh_generation = 2;
     app.provider_models.loading = true;
-    let preset = app.active_preset();
+    let provider_id = app.active_provider_id();
 
     apply_model_refresh_result(
         &mut app,
         ModelRefreshResult {
             generation: 1,
-            preset,
+            provider_id,
             result: Err("stale".to_owned()),
         },
     );
@@ -551,10 +551,13 @@ fn saved_provider_settings(presets: &[&str]) -> ProviderSettingsDto {
     let profiles = presets
         .iter()
         .map(|preset| ProviderProfileDto {
+            id: (*preset).to_owned(),
             preset: (*preset).to_owned(),
+            name: String::new(),
             kind: "chat_completions".into(),
             model: format!("{preset}-model"),
             base_url: "https://example.invalid/v1".into(),
+            enabled_models: Vec::new(),
         })
         .collect::<Vec<_>>();
     ProviderSettingsDto {
@@ -566,7 +569,7 @@ fn saved_provider_settings(presets: &[&str]) -> ProviderSettingsDto {
 
 fn listed_models(count: usize) -> ProviderModelsState {
     ProviderModelsState {
-        preset: Some(ProviderPreset::OpenAi),
+        provider_id: Some("openai".to_owned()),
         models: (0..count)
             .map(|index| ProviderModelDto {
                 id: format!("model-{index:02}"),
@@ -794,12 +797,12 @@ async fn provider_picker_rows_map_to_the_rendered_provider() {
     );
     for row in inner.y..inner.bottom() {
         let text = picker_row(&terminal, row, inner.x, inner.right());
-        let preset = crate::app::provider::provider_menu_selection(&app, picker, inner.x + 2, row)
+        let choice = crate::app::provider::provider_menu_selection(&app, picker, inner.x + 2, row)
             .unwrap_or_else(|| panic!("row {row} paints {text:?} but resolves no provider"));
         assert!(
-            text.contains(preset.label()),
+            text.contains(choice.label.as_str()),
             "row {row} paints {text:?} but the click resolves {}",
-            preset.label()
+            choice.label
         );
     }
 

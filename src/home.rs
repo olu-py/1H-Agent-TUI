@@ -91,14 +91,14 @@ impl HomeState {
         for candidate in providers {
             if !unique_providers
                 .iter()
-                .any(|existing: &ProviderConfig| existing.preset == candidate.preset)
+                .any(|existing: &ProviderConfig| existing.id() == candidate.id())
             {
                 unique_providers.push(candidate);
             }
         }
         if let Some(active) = unique_providers
             .iter_mut()
-            .find(|candidate| candidate.preset == provider.preset)
+            .find(|candidate| candidate.id() == provider.id())
         {
             *active = provider.clone();
         } else {
@@ -279,8 +279,8 @@ impl HomeState {
         }
     }
 
-    fn provider_label(&self) -> &'static str {
-        self.provider.preset.label()
+    fn provider_label(&self) -> String {
+        self.provider.display_label().to_owned()
     }
 
     fn model_choices(&self) -> Vec<String> {
@@ -304,7 +304,7 @@ impl HomeState {
             HomeMenuKind::Provider => self
                 .providers
                 .iter()
-                .position(|provider| provider.preset == self.provider.preset)
+                .position(|provider| provider.id() == self.provider.id())
                 .unwrap_or(0),
             HomeMenuKind::Model => self
                 .model_choices()
@@ -394,7 +394,7 @@ impl HomeState {
                     if let Some(saved) = self
                         .providers
                         .iter_mut()
-                        .find(|provider| provider.preset == self.provider.preset)
+                        .find(|provider| provider.id() == self.provider.id())
                     {
                         *saved = self.provider.clone();
                     }
@@ -875,7 +875,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &mut HomeState, theme: 
     };
     if full_width <= width {
         let separator = " / ";
-        let provider_width = UnicodeWidthStr::width(provider_label) as u16;
+        let provider_width = UnicodeWidthStr::width(provider_label.as_str()) as u16;
         let separator_width = UnicodeWidthStr::width(separator) as u16;
         let model_width = UnicodeWidthStr::width(model_label) as u16;
         state.provider_rect = (provider_width > 0)
@@ -926,7 +926,7 @@ fn draw_menu(
             state
                 .providers
                 .iter()
-                .map(|provider| provider.preset.label().to_owned())
+                .map(|provider| provider.display_label().to_owned())
                 .collect::<Vec<_>>(),
             " 选择供应商 ".to_owned(),
             state.provider_rect,

@@ -7,10 +7,13 @@ use crate::ui_view_model::{
 /// Model picker entries for the active provider.
 ///
 /// Merge order follows the parity plan: core dynamic list, preset static
-/// fallback, current model, then models saved on other profiles of the same
-/// preset. Deduping keys off the model id; the decorated label is display-only.
+/// fallback, current model, then the model saved on the active profile. Deduping
+/// keys off the model id; the decorated label is display-only. The dynamic list
+/// and the saved-model fallback are keyed by provider *id*, so another custom
+/// provider's model never leaks in.
 pub(crate) fn model_choices(app: &App) -> Vec<ModelChoice> {
     let preset = app.active_preset();
+    let active_id = app.active_provider_id();
     let mut choices: Vec<ModelChoice> = Vec::new();
     let mut push = |id: String, window: Option<u64>| {
         let id = id.trim().to_owned();
@@ -22,7 +25,7 @@ pub(crate) fn model_choices(app: &App) -> Vec<ModelChoice> {
             id,
         });
     };
-    if app.provider_models.preset == Some(preset) {
+    if app.provider_models.provider_id.as_deref() == Some(active_id.as_str()) {
         for model in &app.provider_models.models {
             push(model.id.clone(), model.context_window_tokens);
         }
@@ -39,10 +42,12 @@ pub(crate) fn model_choices(app: &App) -> Vec<ModelChoice> {
         .and_then(|model| model.context_window_tokens);
     push(current, current_window);
     if let Some(settings) = &app.provider_settings {
-        for profile in &settings.saved {
-            if profile.preset == preset.key_id() {
-                push(profile.model.clone(), None);
-            }
+        if let Some(profile) = settings
+            .saved
+            .iter()
+            .find(|profile| profile.id == active_id)
+        {
+            push(profile.model.clone(), None);
         }
     }
     choices
@@ -68,14 +73,31 @@ fn compact_window(tokens: u64) -> String {
     }
 }
 
+/// One row of the provider switcher: the stable id plus its display label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderChoice {
+    pub id: String,
+    pub label: String,
+}
+
+impl ProviderChoice {
+    fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+}
+
 /// Provider switcher entries, derived from the core-authoritative settings
-/// view when available: registry order, then connected/saved/active presets.
-/// The local config is only a startup fallback before the first core read.
-pub(crate) fn provider_choices(app: &App) -> Vec<ProviderPreset> {
-    let mut choices: Vec<ProviderPreset> = Vec::new();
-    let mut push = |preset: ProviderPreset| {
-        if !choices.contains(&preset) {
-            choices.push(preset);
+/// view when available. Built-in families come first (in registry order), then
+/// every saved custom provider; the active provider is always present. The
+/// local config is only a startup fallback before the first core read.
+pub(crate) fn provider_choices(app: &App) -> Vec<ProviderChoice> {
+    let mut choices: Vec<ProviderChoice> = Vec::new();
+    let mut push = |id: String, label: String| {
+        if !id.is_empty() && !choices.iter().any(|choice| choice.id == id) {
+            choices.push(ProviderChoice::new(id, label));
         }
     };
     if let Some(settings) = &app.provider_settings {
@@ -84,20 +106,42 @@ pub(crate) fn provider_choices(app: &App) -> Vec<ProviderPreset> {
             let saved = settings
                 .saved
                 .iter()
-                .any(|profile| profile.preset == preset.key_id());
-            let active = settings.active.preset == preset.key_id();
-            if connected || saved || active {
-                push(preset);
+                .find(|profile| profile.id == preset.key_id());
+            let active = settings.active.id == preset.key_id();
+            if connected || saved.is_some() || active {
+                let label = saved
+                    .map(|profile| profile.name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| preset.label().to_owned());
+                push(preset.key_id().to_owned(), label);
             }
+        }
+        // Custom providers, in saved order, under their user-given names.
+        for profile in &settings.saved {
+            if profile.preset != ProviderPreset::Custom.key_id() {
+                continue;
+            }
+            let label = if profile.name.trim().is_empty() {
+                ProviderPreset::Custom.label().to_owned()
+            } else {
+                profile.name.trim().to_owned()
+            };
+            push(profile.id.clone(), label);
         }
     } else {
         for provider in &app.config.providers {
-            push(provider.preset);
+            let label = if provider.name.trim().is_empty() {
+                provider.preset.label().to_owned()
+            } else {
+                provider.name.trim().to_owned()
+            };
+            push(provider.id().to_owned(), label);
         }
     }
-    let active = app.active_preset();
-    if !choices.contains(&active) {
-        choices.insert(0, active);
+    let active_id = app.active_provider_id();
+    if !choices.iter().any(|choice| choice.id == active_id) {
+        choices.insert(0, ProviderChoice::new(active_id, app.provider_label()));
     }
     choices
 }
@@ -118,16 +162,22 @@ pub(super) async fn refresh_provider_settings(app: &mut App) -> Result<()> {
 /// the settings form and footer seed from the same authority. The DTO omits
 /// thinking/retry fields, so those local values are preserved.
 fn sync_local_config_from_provider_settings(app: &mut App) {
-    let Some((preset, model, base_url, kind)) = app.provider_settings.as_ref().map(|settings| {
-        (
-            ProviderPreset::parse(&settings.active.preset),
-            settings.active.model.clone(),
-            settings.active.base_url.clone(),
-            ProviderKind::parse_wire_tag(&settings.active.kind),
-        )
-    }) else {
+    let Some((id, preset, model, base_url, kind)) =
+        app.provider_settings.as_ref().map(|settings| {
+            (
+                settings.active.id.clone(),
+                ProviderPreset::parse(&settings.active.preset),
+                settings.active.model.clone(),
+                settings.active.base_url.clone(),
+                ProviderKind::parse_wire_tag(&settings.active.kind),
+            )
+        })
+    else {
         return;
     };
+    if !id.is_empty() {
+        app.config.provider.id = id;
+    }
     if let Some(preset) = preset {
         app.config.provider.preset = preset;
     }
@@ -143,12 +193,12 @@ fn sync_local_config_from_provider_settings(app: &mut App) {
 /// Reads the provider model list. `refresh = false` is cache-only and safe to
 /// await inline; `refresh = true` must go through [`spawn_model_refresh`].
 pub(super) async fn load_provider_models(app: &mut App, refresh: bool) -> Result<()> {
-    let preset = app.active_preset();
+    let provider_id = app.active_provider_id();
     let result = app.handle.provider_models(refresh).await;
     match result {
         Ok(models) => {
             app.provider_models = ProviderModelsState {
-                preset: Some(preset),
+                provider_id: Some(provider_id),
                 models: models.models,
                 fetched_at: models.fetched_at,
                 loading: false,
@@ -173,7 +223,7 @@ pub(super) fn spawn_model_refresh(app: &mut App) {
     }
     app.model_refresh_generation = app.model_refresh_generation.wrapping_add(1);
     let generation = app.model_refresh_generation;
-    let preset = app.active_preset();
+    let provider_id = app.active_provider_id();
     app.provider_models.loading = true;
     app.provider_models.last_error = None;
     app.current.status = "模型列表刷新中……".into();
@@ -187,7 +237,7 @@ pub(super) fn spawn_model_refresh(app: &mut App) {
         let _ = sender
             .send(ModelRefreshResult {
                 generation,
-                preset,
+                provider_id,
                 result,
             })
             .await;
@@ -206,13 +256,13 @@ pub(super) fn apply_model_refresh_result(app: &mut App, refresh: ModelRefreshRes
     }
     // A provider switch may have landed while the refresh was in flight; a
     // stale answer must never overwrite the new provider's model list.
-    if app.active_preset() != refresh.preset {
+    if app.active_provider_id() != refresh.provider_id {
         return;
     }
     match refresh.result {
         Ok(models) => {
             app.provider_models = ProviderModelsState {
-                preset: Some(refresh.preset),
+                provider_id: Some(refresh.provider_id),
                 models: models.models,
                 fetched_at: models.fetched_at,
                 loading: false,
@@ -257,10 +307,10 @@ pub(super) async fn open_footer_menu(app: &mut App, menu: FooterMenu) -> Result<
     match menu {
         FooterMenu::Provider => {
             let _ = refresh_provider_settings(app).await;
-            let active = app.active_preset();
+            let active = app.active_provider_id();
             app.provider_menu_selected = provider_choices(app)
                 .iter()
-                .position(|preset| *preset == active)
+                .position(|choice| choice.id == active)
                 .unwrap_or(0);
             app.provider_menu_open = true;
         }
@@ -330,8 +380,8 @@ pub(super) async fn handle_provider_mouse(
             .filter(|picker| picker.contains(mouse.column, mouse.row))
             .and_then(|picker| provider_menu_selection(app, picker, mouse.column, mouse.row));
         close_footer_menus(app);
-        if let Some(preset) = selected {
-            app.apply_provider_choice(preset).await?;
+        if let Some(choice) = selected {
+            app.apply_provider_choice(choice.id).await?;
         }
         return Ok(Some(EventOutcome::redraw()));
     }
@@ -349,10 +399,10 @@ pub(super) fn provider_menu_selection(
     picker: PickerGeometry,
     column: u16,
     row: u16,
-) -> Option<ProviderPreset> {
+) -> Option<ProviderChoice> {
     picker
         .item_at(column, row)
-        .and_then(|index| provider_choices(app).get(index).copied())
+        .and_then(|index| provider_choices(app).get(index).cloned())
 }
 
 pub(super) fn provider_menu_key_handled(code: KeyCode) -> bool {
@@ -370,9 +420,9 @@ pub(super) async fn handle_provider_menu_key(app: &mut App, code: KeyCode) -> Re
     let choices = provider_choices(app);
     move_menu_cursor(&mut app.provider_menu_selected, code, choices.len());
     if code == KeyCode::Enter {
-        if let Some(preset) = choices.get(app.provider_menu_selected).copied() {
+        if let Some(choice) = choices.get(app.provider_menu_selected).cloned() {
             close_footer_menus(app);
-            app.apply_provider_choice(preset).await?;
+            app.apply_provider_choice(choice.id).await?;
         }
     }
     Ok(())

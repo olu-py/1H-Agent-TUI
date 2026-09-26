@@ -147,10 +147,10 @@ impl EventOutcome {
 
 /// TUI cache of the core's dynamic provider model list. The core remains the
 /// source of truth; this only mirrors the last `provider_models` answer for the
-/// active preset so menus can render without another round trip.
+/// active provider *id* so menus can render without another round trip.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderModelsState {
-    pub preset: Option<ProviderPreset>,
+    pub provider_id: Option<String>,
     pub models: Vec<ProviderModelDto>,
     pub fetched_at: Option<i64>,
     pub loading: bool,
@@ -161,7 +161,7 @@ pub struct ProviderModelsState {
 #[derive(Debug)]
 pub(crate) struct ModelRefreshResult {
     pub generation: u64,
-    pub preset: ProviderPreset,
+    pub provider_id: String,
     pub result: std::result::Result<ProviderModelsDto, String>,
 }
 
@@ -826,30 +826,25 @@ impl App {
                 .iter()
                 .all(|task| task.status == TodoStatus::Done);
         self.config.provider.model = snapshot.model.clone();
-        if let Some(preset) = ProviderPreset::ALL
-            .iter()
-            .copied()
-            .find(|preset| preset.label() == snapshot.provider)
-        {
-            self.config.provider.preset = preset;
-        }
+        // The snapshot carries the active provider id (and its display label
+        // separately). Keying off the id keeps two custom providers with the
+        // same-looking label from being confused with one another.
+        let snapshot_id = snapshot.provider_id.as_str();
         if let Some(provider) = self
             .config
             .providers
             .iter_mut()
-            .find(|provider| provider.preset.label() == snapshot.provider)
+            .find(|provider| provider.id() == snapshot_id)
         {
             provider.model = snapshot.model.clone();
             self.config.provider = provider.clone();
+        } else if self.config.provider.id() == snapshot_id {
+            // Nothing saved to sync onto; keep the active copy's model fresh.
         }
         if let Some(settings) = &mut self.provider_settings {
             settings.active.model = snapshot.model.clone();
-            if let Some(preset) = ProviderPreset::ALL
-                .iter()
-                .copied()
-                .find(|preset| preset.label() == snapshot.provider)
-            {
-                settings.active.preset = preset.key_id().to_owned();
+            if !snapshot_id.is_empty() {
+                settings.active.id = snapshot_id.to_owned();
             }
         }
     }

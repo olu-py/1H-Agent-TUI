@@ -227,35 +227,42 @@ fn format_bytes(bytes: u64) -> String {
 pub(super) enum SettingsRow {
     Section(&'static str),
     Field(SettingsField),
+    /// TUI-only display-name input for custom providers, rendered right after
+    /// the read-only template row. The core DTO carries `name`, but the shared
+    /// `FIELDS` registry has no slot for it, so it is edited here and passed to
+    /// `set_provider_profile`.
+    Name,
     /// TUI-only context-window override; the core DTO does not carry it, so it
     /// is edited through the same form and passed to `set_provider_profile`.
     ContextWindow,
     Spacer,
 }
 
-/// TUI row index of the synthetic context-window override. Rendered right
-/// after Thinking, so it takes Thinking's following slot and ApiKey shifts by
-/// one.
-fn context_window_row() -> usize {
-    FIELDS.len().saturating_sub(1)
+/// TUI row index of the synthetic provider-name row (right after Preset).
+fn name_row() -> usize {
+    1
 }
 
-/// TUI row index for a core field. ApiKey follows the synthetic row, so it is
-/// shifted by one.
+/// TUI row index of the synthetic context-window override. Rendered right
+/// after Thinking, so ApiKey shifts by one more.
+fn context_window_row() -> usize {
+    FIELDS.len()
+}
+
+/// TUI row index for a core field. The name row shifts every field after Preset
+/// by one, and ApiKey is shifted once more by the context-window row.
 fn tui_field_row(field: SettingsField) -> usize {
     let index = FIELDS
         .iter()
         .position(|spec| spec.field == field)
         .unwrap_or(0);
-    if index >= FIELDS.len().saturating_sub(1) {
-        index + 1
-    } else {
-        index
-    }
+    let name_shift = usize::from(index >= name_row());
+    let window_shift = usize::from(index >= FIELDS.len().saturating_sub(1));
+    index + name_shift + window_shift
 }
 
 pub(super) fn settings_rows() -> Vec<SettingsRow> {
-    let mut rows = Vec::with_capacity(FIELDS.len() * 2 + 4);
+    let mut rows = Vec::with_capacity(FIELDS.len() * 2 + 5);
     let mut last_section = None;
     for spec in FIELDS {
         if last_section != Some(spec.section) {
@@ -264,6 +271,10 @@ pub(super) fn settings_rows() -> Vec<SettingsRow> {
             rows.push(SettingsRow::Spacer);
         }
         rows.push(SettingsRow::Field(spec.field));
+        if spec.field == SettingsField::Preset {
+            // The custom display name follows the template row.
+            rows.push(SettingsRow::Name);
+        }
         if spec.field == SettingsField::Thinking {
             // The override sits with the other advanced knobs, immediately
             // after Thinking and before the write-only API key.
@@ -308,12 +319,12 @@ fn draw_provider_list(
     ];
     for (index, provider) in list.providers.iter().enumerate() {
         let selected = index == list.selected;
-        let current = if provider.preset == list.active {
+        let current = if provider.id() == list.active {
             " 当前"
         } else {
             ""
         };
-        let status = if list.connected.contains(&provider.preset) {
+        let status = if list.connected.contains(provider.id()) {
             "已连接"
         } else {
             "需要 API Key"
@@ -322,7 +333,7 @@ fn draw_provider_list(
             format!(
                 "  {} {:<20} {:<26} {status}{current}",
                 if selected { "›" } else { " " },
-                provider.preset.label(),
+                provider.display_label(),
                 provider.model
             ),
             if selected {
@@ -424,7 +435,11 @@ fn draw_provider_form(
     let visible = (inner.height as usize).saturating_sub(footer_rows);
 
     let rows = settings_rows();
-    let selected_row = if app.settings_field_index == context_window_row() {
+    let selected_row = if app.settings_field_index == name_row() {
+        rows.iter()
+            .position(|row| matches!(row, SettingsRow::Name))
+            .unwrap_or(0)
+    } else if app.settings_field_index == context_window_row() {
         rows.iter()
             .position(|row| matches!(row, SettingsRow::ContextWindow))
             .unwrap_or(0)
@@ -458,6 +473,35 @@ fn draw_provider_form(
                     format!("  ━━ {section} {}", "━".repeat(fill)),
                     theme.strong(VisualRole::Accent),
                 )));
+            }
+            SettingsRow::Name => {
+                let selected = app.settings_field_index == name_row();
+                let marker = if selected { "›" } else { " " };
+                let label = "名称";
+                let label_pad = " "
+                    .repeat(SETTINGS_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(label)));
+                let value = if form.provider.name.trim().is_empty() {
+                    "（内置/未命名）".to_owned()
+                } else {
+                    form.provider.name.clone()
+                };
+                let label_style = if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Primary)
+                };
+                let value_style = if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Secondary)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {marker} {label}{label_pad}"), label_style),
+                    Span::styled(
+                        format!("  {}", fit_text(value.as_str(), value_width)),
+                        value_style,
+                    ),
+                ]));
             }
             SettingsRow::ContextWindow => {
                 let selected = app.settings_field_index == context_window_row();
@@ -534,7 +578,7 @@ fn draw_provider_form(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(format!(" 编辑 {} ", form.provider.preset.label()))
+                    .title(format!(" 编辑 {} ", form.provider.display_label()))
                     .borders(Borders::ALL)
                     .border_style(theme.focus_border),
             )

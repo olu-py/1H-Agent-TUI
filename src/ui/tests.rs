@@ -94,7 +94,10 @@ fn settings_rows_group_fields_in_order() {
         .iter()
         .filter_map(|row| match row {
             SettingsRow::Section(section) => Some(*section),
-            SettingsRow::Field(_) | SettingsRow::ContextWindow | SettingsRow::Spacer => None,
+            SettingsRow::Field(_)
+            | SettingsRow::Name
+            | SettingsRow::ContextWindow
+            | SettingsRow::Spacer => None,
         })
         .collect();
     assert_eq!(sections, vec!["基础", "连接", "高级"]);
@@ -102,7 +105,10 @@ fn settings_rows_group_fields_in_order() {
     let fields: Vec<SettingsField> = rows
         .iter()
         .filter_map(|row| match row {
-            SettingsRow::Section(_) | SettingsRow::ContextWindow | SettingsRow::Spacer => None,
+            SettingsRow::Section(_)
+            | SettingsRow::Name
+            | SettingsRow::ContextWindow
+            | SettingsRow::Spacer => None,
             SettingsRow::Field(field) => Some(*field),
         })
         .collect();

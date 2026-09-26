@@ -409,7 +409,7 @@ impl UiViewModel {
                 FooterLine {
                     left: metadata_segments(
                         app.current.mode,
-                        app.provider_label(),
+                        &app.provider_label(),
                         app.model_name(),
                         density,
                     ),
