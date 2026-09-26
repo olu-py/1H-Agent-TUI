@@ -9,8 +9,20 @@ impl App {
         self.provider_models.loading = false;
     }
 
-    /// Core-authoritative active preset, falling back to the local config
-    /// snapshot before the first `provider_settings()` read.
+    /// Core-authoritative active provider id, falling back to the local config
+    /// snapshot before the first `provider_settings()` read. Everything the
+    /// picker, model list and settings panel address is keyed off this id, so
+    /// several custom providers stay distinguishable.
+    pub(crate) fn active_provider_id(&self) -> String {
+        self.provider_settings
+            .as_ref()
+            .map(|settings| settings.active.id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| self.config.provider.id().to_owned())
+    }
+
+    /// Template/family of the active provider. `preset` is only the request
+    /// protocol family now; identity is the provider id.
     pub(crate) fn active_preset(&self) -> ProviderPreset {
         self.provider_settings
             .as_ref()
@@ -27,8 +39,21 @@ impl App {
             .unwrap_or(&self.config.provider.model)
     }
 
-    pub(crate) fn provider_label(&self) -> &'static str {
-        self.active_preset().label()
+    /// Human-facing active provider label: the custom name when present, else
+    /// the preset label. Owned because a custom name is runtime data.
+    pub(crate) fn provider_label(&self) -> String {
+        if let Some(settings) = &self.provider_settings {
+            let name = settings.active.name.trim();
+            if !name.is_empty() {
+                return name.to_owned();
+            }
+        } else if let Some(profile) = self.config.provider_for_id(&self.active_provider_id()) {
+            let name = profile.name.trim();
+            if !name.is_empty() {
+                return name.to_owned();
+            }
+        }
+        self.active_preset().label().to_owned()
     }
 
     pub(crate) fn model_name(&self) -> &str {
@@ -225,14 +250,31 @@ impl App {
         Ok(())
     }
 
-    pub(super) async fn apply_provider_choice(&mut self, preset: ProviderPreset) -> Result<()> {
-        if preset == self.active_preset() {
+    /// Switches the active provider to the saved profile with `id` (a built-in
+    /// preset key or a generated custom id). The target's own saved model wins;
+    /// otherwise the template default is used, because carrying the old
+    /// provider's model across would pair an unrelated model id with it.
+    pub(super) async fn apply_provider_choice(&mut self, id: String) -> Result<()> {
+        if id == self.active_provider_id() {
             return Ok(());
         }
         self.cancel_model_refresh();
-        // Prefer the target preset's saved model; otherwise use its template
-        // default. Carrying the old provider's model across would pair an
-        // unrelated model id with the new provider.
+        let template = self
+            .provider_settings
+            .as_ref()
+            .and_then(|settings| {
+                settings
+                    .saved
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .and_then(|profile| ProviderPreset::parse(&profile.preset))
+            })
+            .or_else(|| {
+                self.config
+                    .provider_for_id(&id)
+                    .map(|profile| profile.preset)
+            })
+            .unwrap_or(self.active_preset());
         let model = self
             .provider_settings
             .as_ref()
@@ -240,12 +282,18 @@ impl App {
                 settings
                     .saved
                     .iter()
-                    .find(|profile| profile.preset == preset.key_id())
+                    .find(|profile| profile.id == id)
                     .map(|profile| profile.model.clone())
             })
             .filter(|model| !model.trim().is_empty())
-            .unwrap_or_else(|| preset.defaults().model);
-        if let Err(error) = self.handle.set_provider(preset.key_id(), &model).await {
+            .or_else(|| {
+                self.config
+                    .provider_for_id(&id)
+                    .map(|profile| profile.model)
+                    .filter(|model| !model.trim().is_empty())
+            })
+            .unwrap_or_else(|| template.defaults().model);
+        if let Err(error) = self.handle.set_provider(&id, &model).await {
             self.current.status = secrets::redact(&error.message);
             return Ok(());
         }
@@ -264,8 +312,8 @@ impl App {
             return Ok(());
         }
         self.cancel_model_refresh();
-        let preset = self.active_preset();
-        if let Err(error) = self.handle.set_provider(preset.key_id(), &model).await {
+        let provider_id = self.active_provider_id();
+        if let Err(error) = self.handle.set_provider(&provider_id, &model).await {
             self.current.status = secrets::redact(&error.message);
             return Ok(());
         }

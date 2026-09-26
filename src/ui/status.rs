@@ -93,7 +93,7 @@ fn provider_model_rects(area: Rect, view: &UiViewModel, app: &App) -> (Option<Re
     }
     let prefix_width = UnicodeWidthStr::width(prefix.as_str()) as u16;
     let visible_width = UnicodeWidthStr::width(text) as u16;
-    let provider_width = UnicodeWidthStr::width(app.provider_label()) as u16;
+    let provider_width = UnicodeWidthStr::width(app.provider_label().as_str()) as u16;
     let separator_width = UnicodeWidthStr::width(" · ") as u16;
     let model_width = UnicodeWidthStr::width(app.model_name()) as u16;
     let provider_x = area.x.saturating_add(prefix_width);
@@ -126,14 +126,14 @@ pub(super) fn draw_provider_menu(
     // while the frame still grows upward from its own footer control.
     let rows = choices
         .iter()
-        .map(|preset| {
+        .map(|choice| {
             let connected = app
                 .provider_settings
                 .as_ref()
-                .is_some_and(|settings| settings.connected.iter().any(|id| id == preset.key_id()));
+                .is_some_and(|settings| settings.connected.iter().any(|id| id == &choice.id));
             format!(
                 "{:<14} {}",
-                preset.label(),
+                choice.label,
                 if connected {
                     "已连接"
                 } else {

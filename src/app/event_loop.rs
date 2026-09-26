@@ -166,8 +166,8 @@ async fn apply_home_selection(
     session_id: &str,
     selection: &HomeSelection,
 ) -> Result<()> {
-    if selection.provider.preset != config.provider.preset {
-        let _ = secrets::api_key_cached(selection.provider.preset);
+    if selection.provider.id() != config.provider.id() {
+        let _ = secrets::api_key_cached(selection.provider.preset, selection.provider.id());
         handle
             .set_provider_config(selection.provider.clone())
             .await?;

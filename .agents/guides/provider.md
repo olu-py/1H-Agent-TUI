@@ -6,23 +6,25 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 
 ## 入口
 
-- 配置：`ProviderConfig`、`ProviderPreset`、`provider_for`、`upsert_provider`、`remove_provider`（`protium-core (Git dependency): src/config.rs`）。
+- 配置：`ProviderConfig`（稳定 `id` + 模板 `preset` + 可选 `name`/`enabled_models`）、`ProviderPreset`、`provider_for_id`/`provider_for`、`upsert_provider`、`remove_provider_by_id`（`protium-core (Git dependency): src/config.rs`）。
 - 密钥：`api_key_cached*`、`store_api_key_cached`（core `secrets` facade），仅存在性/解锁入口暴露给消费端。
 - 切换：消费端只经 `AppHandle::set_provider`/`set_provider_config`/`remove_provider` 提交，不直接改配置；首页选择 `HomeSelection`/`apply_home_selection` 是 TUI 侧入口。
 - 请求/恢复：`replay_safe_items`、请求游标、`protium-core (Git dependency): src/provider/openai.rs`、`storage.rs` 的 Provider 状态。
 
 ## 不变量
 
-- `Config.provider` 是当前连接；`Config.providers` 按预设唯一保存完整档案。旧 `[provider]` 无损迁移，API Key 永不序列化。
+- `Config.provider` 是当前连接；`Config.providers` 按稳定 `id` 唯一保存完整档案——内置四家仍各一份，自定义供应商可多份共存（`custom-<32 hex>`，显示名必填且 trim + 大小写不敏感去重，历史无名 custom 允许空名回退 preset 标签）。旧 `[provider]`/无 `id` 的旧档案在 `Config::load` 规范化为 `preset.key_id()` 后无损迁移（单一 custom 保持 `"custom"`），API Key 永不序列化。
 - 非密钥配置按默认值 -> TOML -> 环境变量覆盖；模板只用 `ProviderPreset::defaults`，不得复制默认 URL。
-- 启动只用 `api_key_cached` 解锁当前 Provider 一次，其他环境变量密钥可无交互预热；不得遍历独立钥匙串条目。显式切换/编辑 Provider 可按需解锁一次，Agent 热路径只用 `api_key_cached_only`；新密钥通过 `store_api_key_cached` 同步钥匙串和内存。显式恢复/激活会话时按目标会话保存的 Provider 用 `api_key_cached` 解锁一次（`build_app`/`activate_session`），恢复后的 runtime 才拥有可用 runner。
+- 启动只用 `api_key_cached` 解锁当前 Provider 一次，其他环境变量密钥可无交互预热（按 preset 家族查环境变量、按 id 入缓存）；不得遍历独立钥匙串条目。钥匙串账户名与进程缓存键均为 provider id：内置 id == preset key（向后兼容），自定义 id 各自独立。显式切换/编辑 Provider 可按需解锁一次，Agent 热路径只用 `api_key_cached_only`；新密钥通过 `store_api_key_cached` 同步钥匙串和内存。显式恢复/激活会话时按目标会话保存的 Provider 用 `api_key_cached` 解锁一次（`build_app`/`activate_session`），恢复后的 runtime 才拥有可用 runner。
 - 消费端不读取 API Key 进模型上下文、不直接构造 Provider 请求、不解析私有 JSON/SSE；Provider 事件先规范化为公共 `ModelEvent`，再经 protocol 映射给消费端。
-- 首页只复制按 preset 去重的非密钥档案；仅 `StartNew` 将所选 Provider/模型/mode 应用到配置与新会话并按需解锁，`Resume` 仍恢复目标会话状态。
+- 首页只复制按 id 去重的非密钥档案（自定义供应商标题用显示名，输入区 pill 为 `名称 · 模型`）；仅 `StartNew` 将所选 Provider/模型/mode 应用到配置与新会话并按需解锁，`Resume` 仍恢复目标会话状态。设置面板可新建/重命名/编辑/删除自定义供应商，名称 trim 后必填且与内置显示名及已有自定义名大小写不敏感去重，校验与错误文案由 core 返回。
 - 切换 Provider/模型必须重建 runner 并清理旧 `response_id`。增量游标从最新用户消息开始且保留其后 `@` 上下文。
 - 容量预算（core 唯一权威）：`context_window_tokens` 显式优先，否则查 Provider 感知注册表；未知模型返回 `None`（不设默认窗口），必须显式配置。`max_output_tokens` 既是每请求输出硬上限（Responses 用 `max_output_tokens`、OpenAI chat 用 `max_completion_tokens`、其他 chat 用 `max_tokens`）也是输出预留。`safe_input_capacity = 窗口 − 输出预留 − 系统开销(4096)`；超窗先全轮压缩，失败再 hinted 硬裁并插入本地化提示，绝不静默预裁。
 - 压缩检查点和 `/uncompact` 都清理 `previous_response_id`；压缩摘要不得与旧服务端状态混用。
 - 服务端状态失效后先清 ID，再用 `replay_safe_items` 重放；不得发送孤立 output 或无结果 call。
 - DeepSeek Responses 不用 previous ID；原生搜索与同名本地 tool 互斥。
+- 跨 Provider 子 Agent 按 provider id 解析（`ChildProviderResolver = Fn(&str)`，`agent_spawn` 的 `provider` 也可给已保存自定义供应商的 `name` 或旧 preset 名）；`session_provider_config` 先按 id 查 saved/active，再回退 `ProviderPreset::parse` 兼容旧行；子会话 `provider` 列写 id。
+- `enabled_models` 本期只持久化并经 DTO 往返（空 = 不限），不参与运行时过滤，也不改动模型列表拉取路径；"真正使用的模型"勾选留作后续独立改动。
 - Reasoning 事件按增量语义处理：空 content 不结束思考，done 的完整文本不重复追加；Qwen 3.7/3.8 字段按各协议隔离。
 - 诊断输出始终脱敏；HTTP 层指数退避重试仅在"未发出任何事件"的失败上生效（连接/发送阶段错误与 408/429/500/502/503/504）；流中断不重试，由 agent 层空输出重放兜底；`Retry-After` 优先并被 clamp 到 `retry_max_backoff_ms`。重试上限与退避参数来自 `ProviderConfig`（0 关闭）并 clamp。
 
