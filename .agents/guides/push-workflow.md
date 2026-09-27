@@ -16,7 +16,8 @@
 
 ## 不变量
 
-- `main` 只接收已通过 PR 检查并合并的改动；不直接 push `main`，不使用 `--force` 掩盖分歧，不绕过 required checks 或保护规则；只有确认是个人功能分支、无人依赖且用户请求与项目策略允许时，才考虑 `--force-with-lease`。
+- 默认走功能分支 + PR；`main` 只接收已通过 PR 检查并合并的改动。仅当用户在当前任务中明确要求直推、且 diff 每个文件都是文档级改动（仅 `*.md`、纯注释行、纯格式/行尾）时，才允许直接 push `main`：用 `pwsh -File scripts/push.ps1 -Branch main -AllowMain`，推后必须确认新 head 的 CI，失败用新的 revert 提交回滚（绝不 force）。脚本、workflow、`Cargo.toml`/`Cargo.lock`、`src/**` 即使只改一行也必须走 PR。
+- 不使用 `--force` 掩盖分歧，不绕过 required checks 或保护规则；只有确认是个人功能分支、无人依赖且用户请求与项目策略允许时，才考虑 `--force-with-lease`（`main` 上永不使用）。
 - 合并策略服从仓库设置；squash/rebase 后 head SHA 与 merge SHA 可不同。PR closed 不代表 merged。
 - GitHub 插件用于读取 PR/CI 和执行获准的 GitHub 操作；本地 Git 命令负责本地提交与分支同步。
 - core/TUI 联调保留 `--config` 临时 path patch；正式交付移除覆盖，先合并 core，再在 TUI 单独建 PR 更新锁文件和适配。
@@ -29,6 +30,7 @@
 | PR checks/评审/合并阻塞 | 按 GitHub 返回的具体规则修复并重新验证，不绕过门禁。 |
 | 合并成功但本地不一致 | fetch、切换 main、尝试 `--ff-only`；失败时不 reset，先查明本地提交和改动。 |
 | 凭据或权限异常 | 使用已授权的连接重试；不把 token 写入命令、文件、日志或回复。 |
+| 直推 main 被 hook 或 CI 拒绝 | 说明改动不是纯文档；改为功能分支 + PR，或先 revert 再交付。 |
 
 ## 验证
 
