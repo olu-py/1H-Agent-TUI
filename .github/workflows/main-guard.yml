@@ -1,0 +1,59 @@
+name: main guard
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-guard
+  cancel-in-progress: false
+
+jobs:
+  documentation-only:
+    name: Direct push to main is documentation-only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check pushed range
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          subject="$(git log -1 --pretty=%s "$AFTER")"
+          case "$subject" in
+            'Merge pull request #'*|'Revert "'*)
+              echo "non-direct landing ($subject); skipping guard."
+              exit 0
+              ;;
+          esac
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "no usable before commit; nothing to compare."
+            exit 0
+          fi
+          mapfile -t files < <(git diff --name-only "$BEFORE..$AFTER")
+          deny='^(\.github/workflows/|Cargo\.toml$|Cargo\.lock$|src/|crates/|web/src/)'
+          bad=0
+          for f in "${files[@]}"; do
+            [ -n "$f" ] || continue
+            if printf '%s' "$f" | grep -Eq "$deny"; then
+              echo "::error file=$f::direct push to main touched a protected path"
+              bad=1
+            elif ! printf '%s' "$f" | grep -Eq '\.md$'; then
+              echo "::error file=$f::direct push to main is limited to *.md changes"
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "rule: main accepts only PR merges, or documentation-only direct pushes explicitly requested by the user."
+            echo "Please revert this push with a new revert commit (never force) and re-deliver via a feature branch and PR."
+            exit 1
+          fi
+          echo "documentation-only direct push to main accepted."

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Blocks direct pushes to main unless every changed file is documentation-only.
+# Install with: pwsh -File scripts/install-hooks.ps1   (CI main-guard.yml is the backstop.)
+set -uo pipefail
+
+deny_re='^(\.github/workflows/|Cargo\.toml$|Cargo\.lock$|src/|crates/|web/src/)'
+zero='0000000000000000000000000000000000000000'
+
+block() {
+  printf 'pre-push: 拒绝直推 main: %s\n' "$1" >&2
+  printf 'pre-push: 默认请走功能分支 + PR；仅纯文档/注释改动可在用户明确指示下直推 main。\n' >&2
+  exit 1
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "${remote_ref:-}" = "refs/heads/main" ] || continue
+
+  # 1. Never allow deleting main.
+  if [ "$local_sha" = "$zero" ]; then
+    block "禁止删除 main"
+  fi
+
+  # 2. Never allow rewriting main: remote must be an ancestor of the pushed tip.
+  if [ "$remote_sha" != "$zero" ]; then
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+      block "非快进更新 main（remote=$remote_sha local=$local_sha）"
+    fi
+    files="$(git diff --name-only "$remote_sha..$local_sha" 2>/dev/null || true)"
+  else
+    files="$(git show --pretty=format: --name-only "$local_sha" 2>/dev/null || true)"
+  fi
+
+  # 3. PR merges and reverts land on main without a branch PR; let both through.
+  tip_subject="$(git log -1 --pretty=%s "$local_sha" 2>/dev/null || true)"
+  case "$tip_subject" in
+    'Merge pull request #'*|'Revert "'*)
+      printf 'pre-push: 非直推 landing（%s），放行。\n' "$tip_subject" >&2
+      continue
+      ;;
+  esac
+
+  # 4. A direct push may only carry documentation-only changes.
+  for f in $files; do
+    [ -n "$f" ] || continue
+    if printf '%s' "$f" | grep -Eq "$deny_re"; then
+      block "改动包含受保护路径: $f"
+    fi
+    if ! printf '%s' "$f" | grep -Eq '\.md$'; then
+      block "改动不在白名单（仅 *.md）: $f"
+    fi
+  done
+done
+
+exit 0
