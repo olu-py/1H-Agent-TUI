@@ -555,10 +555,10 @@ pub(super) async fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: 
             let selected = results.get(palette.selected).copied();
             let action = selected.map(|item| commands::PALETTE_ITEMS[item.index].action);
             app.palette = None;
-            if let Some(action) = action {
-                if let Err(error) = execute_palette_action(app, action).await {
-                    app.current.status = format!("命令失败：{error}");
-                }
+            if let Some(action) = action
+                && let Err(error) = execute_palette_action(app, action).await
+            {
+                app.current.status = format!("命令失败：{error}");
             }
         }
         KeyCode::Up => {
