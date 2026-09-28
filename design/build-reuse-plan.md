@@ -82,7 +82,7 @@ sccache 确实能跨目录、跨工具链命中，但代价明确且本仓不划
 - **TUI 用 1.85 根本编不过**：`error: rustc 1.85.0 is not supported by the following packages: darling@0.24.1、globset@0.4.20、icu_*@2.3.0 requires rustc 1.88`。
 - 而且 TUI 的 `ci.yml` 里**没有** MSRV job——`minimum-rust`（toolchain 1.85.0）在 **core 仓库**的 `ci.yml` 里。所以历史那些 `-core-185`/`-core-msrv` 目录是 core 的 MSRV 复现，这条轴属于 core，不属于 TUI。
 - 结论：core 的 MSRV 构建写进 core 默认 `target/`，与 stable 产物同目录、不同指纹、互不驱逐，repeat 往返均 0 重编（§11 K3–K5）。
-- **附带发现（不在本方案范围）**：TUI 声明的 `rust-version = "1.85"` 已与自己的 `Cargo.lock` 不兼容，且无 CI 覆盖，属于声明腐化。修法二选一——把 `rust-version` 提到 1.88，或在 TUI 的 ci.yml 补一个 `minimum-rust` job 把它变成真约束。
+- **附带发现（不在本方案范围）**：TUI 声明的 `rust-version = "1.85"` 已与自己的 `Cargo.lock` 不兼容，且无 CI 覆盖，属于声明腐化。修法二选一——把 `rust-version` 提到 1.88，或在 TUI 的 ci.yml 补一个 `minimum-rust` job 把它变成真约束。**后续（已施工）**：两件都做了——`rust-version` 改为 `1.88`（先在本机核实过底线：`cargo +1.88.0 test --all-features --locked` 编译 249 个单元、26.5s、116 + 3 全通过），并在 TUI 的 ci.yml 补上 `minimum-rust` 档位。
 
 ## 6 阶段 3：约定落地（已按轻量方案完成）
 
