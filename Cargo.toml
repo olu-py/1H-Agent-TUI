@@ -89,7 +89,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-protium-core = { git = "https://github.com/olu-py/1H-Agent-core.git", rev = "d9d9e0c9889083a253ce4e2471fb702cf284a6c3" }
+protium-core = { git = "https://github.com/olu-py/1H-Agent-core.git", rev = "2fef1678d8f536ed5a6456427318f9b2ab65e0fa" }
 
 [profile.release]
 opt-level = "s"
