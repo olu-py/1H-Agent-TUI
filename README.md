@@ -98,11 +98,11 @@ cargo bench --bench consumer --locked
 
 ### 本地边改边测
 
-将 `1H-Agent` 与 `protium-core` 放在同一父目录后，可在 core 尚未 push 时用 Cargo 命令行配置临时覆盖 Git 依赖：
+将 `1H-Agent` 与 core 检出放在同一父目录后（本机为 `1H-Agent-TUI` 与 `1H-Agent-core`），可在 core 尚未 push 时用 Cargo 命令行配置临时覆盖 Git 依赖：
 
 ```bash
 cargo --config \
-  'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../protium-core"' \
+  'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../1H-Agent-core"' \
   test --lib conformance
 ```
 

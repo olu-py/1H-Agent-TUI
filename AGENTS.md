@@ -22,7 +22,7 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 3. 从 `src/main.rs -> app::run` 进入：TUI 门面是 `src/app.rs`（`App` + `TuiSessionProjection`）；核心接口在独立 `1H-Agent-core` 仓库的 `src/service.rs`、`protocol.rs`、`bridge.rs`。
 4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
 5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
-6. core/TUI 联调先用命令行本地 path patch 指向 `../protium-core`；交付前必须移除 patch、先完成并 push core，再定向更新 Git 锁文件、适配和 `--locked` 复测；禁止编辑 Cargo checkout。
+6. core/TUI 联调先用命令行本地 path patch 指向 `../1H-Agent-core`；交付前必须移除 patch、先完成并 push core，再定向更新 Git 锁文件、适配和 `--locked` 复测；禁止编辑 Cargo checkout。
 
 ## 任务路由
 
@@ -78,3 +78,5 @@ protium-core
 | 发布 | 读取 Release 专题并运行其完整验证 |
 
 保持改动聚焦，复用现有 helper，不清理无法证明无用的文件。未运行的检查必须在最终回复说明；不要因 Cargo 锁或冷缓存终止正常构建。验证档位按改动面判定：纯文档/展示改动可不跑 clippy 与全量；协议适配必须覆盖 match、回放与 projection；跨模块才升级全量。核心源码及其测试只在 `1H-Agent-core` 仓库运行。
+
+构建产物只落在仓库默认 `target/`：不得用 `CARGO_TARGET_DIR` 为工具链或用途另开目录（同目录内 rustc 版本、SourceId 与 clippy 产物各按指纹共存，分开只会重复编译）；中间产物由 `$CARGO_HOME/config.toml` 的 `build.build-dir` 在仓库间共享，因此**不要运行 `cargo clean`**——它会清空共享缓存，需要回收空间时直接删除缓存目录。
