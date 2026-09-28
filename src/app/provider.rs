@@ -61,7 +61,7 @@ fn model_choice_label(id: &str, window: Option<u64>) -> String {
     }
 }
 
-fn compact_window(tokens: u64) -> String {
+pub(super) fn compact_window(tokens: u64) -> String {
     if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
         format!("{}m", tokens / 1_000_000)
     } else if tokens >= 1_000 && tokens % 1_000 == 0 {
@@ -144,6 +144,51 @@ pub(crate) fn provider_choices(app: &App) -> Vec<ProviderChoice> {
         choices.insert(0, ProviderChoice::new(active_id, app.provider_label()));
     }
     choices
+}
+
+/// Marker that identifies the one-shot provider onboarding entry, so it can be
+/// retracted once a key resolves without touching any other system row.
+const PROVIDER_HINT_HEADING: &str = "## 供应商未就绪";
+
+fn provider_hint_entry(app: &App) -> DisplayEntry {
+    DisplayEntry {
+        kind: DisplayKind::System,
+        content: DisplayContent::Markdown(format!(
+            "{PROVIDER_HINT_HEADING}\n\n当前供应商 **{}** 还没有可解析的 API Key。\n\n- 按 **Ctrl+S** 打开供应商设置（也可输入 `/provider`）\n- 密钥只写入系统钥匙串，不进入配置文件、日志或模型上下文",
+            app.provider_label()
+        )),
+    }
+}
+
+fn is_provider_hint(entry: &DisplayEntry) -> bool {
+    matches!(
+        &entry.content,
+        DisplayContent::Markdown(text) if text.starts_with(PROVIDER_HINT_HEADING)
+    )
+}
+
+/// Keeps the onboarding entry in step with the core's key state: it appears on a
+/// fresh, unconfigured transcript and is retracted as soon as a key resolves, so
+/// it can never linger as stale advice after the user acts on it. Bounded to one
+/// entry per run, and never pushed over an existing transcript.
+pub(super) fn sync_provider_hint(app: &mut App) {
+    if !app.provider_needs_key() {
+        if app.current.entries.iter().any(is_provider_hint) {
+            app.current.entries.retain(|entry| !is_provider_hint(entry));
+            app.current.invalidate_output_layout();
+        }
+        return;
+    }
+    if app.provider_hint_shown
+        || app.current.busy
+        || app.has_pending_approval()
+        || !app.current.entries.is_empty()
+    {
+        return;
+    }
+    let entry = provider_hint_entry(app);
+    app.current.push_entry(entry);
+    app.provider_hint_shown = true;
 }
 
 /// Reads the core provider settings view (cache-only, never a network call).
@@ -255,8 +300,11 @@ pub(super) fn apply_model_refresh_result(app: &mut App, refresh: ModelRefreshRes
         return;
     }
     // A provider switch may have landed while the refresh was in flight; a
-    // stale answer must never overwrite the new provider's model list.
+    // stale answer must never overwrite the new provider's model list. A `g`
+    // waiting on this answer is drained either way, so the panel cannot sit on
+    // "正在获取" forever.
     if app.active_provider_id() != refresh.provider_id {
+        super::provider_editor::fill_window_from_models(app);
         return;
     }
     match refresh.result {
@@ -276,6 +324,7 @@ pub(super) fn apply_model_refresh_result(app: &mut App, refresh: ModelRefreshRes
             app.current.status = "模型刷新失败，已保留现有列表".into();
         }
     }
+    super::provider_editor::fill_window_from_models(app);
 }
 
 /// Which footer picker a click or key acts on. Only one picker is open at a
@@ -375,6 +424,18 @@ pub(super) async fn handle_provider_mouse(
         return Ok(app.provider_menu_open.then(EventOutcome::default));
     }
     if app.provider_menu_open {
+        // The pinned action row is painted inside the popup but outside the item
+        // window, so it is resolved from its own rectangle before any row lookup
+        // can mistake it for a provider.
+        let action = app
+            .provider_menu_geometry
+            .and_then(|picker| picker.action)
+            .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect));
+        if action {
+            close_footer_menus(app);
+            super::open_settings(app).await;
+            return Ok(Some(EventOutcome::redraw()));
+        }
         let selected = app
             .provider_menu_geometry
             .filter(|picker| picker.contains(mouse.column, mouse.row))
@@ -405,14 +466,30 @@ pub(super) fn provider_menu_selection(
         .and_then(|index| provider_choices(app).get(index).cloned())
 }
 
-pub(super) fn provider_menu_key_handled(code: KeyCode) -> bool {
+/// Keys the provider picker consumes. `Ctrl+S` is the picker's own entry into
+/// the settings panel — it must be claimed here, or the shared "unhandled key
+/// dismisses the picker" rule would swallow it before the global handler runs.
+pub(super) fn provider_menu_key_handled(code: KeyCode, modifiers: KeyModifiers) -> bool {
     matches!(
         code,
         KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::Enter
-    )
+    ) || opens_provider_settings(code, modifiers)
 }
 
-pub(super) async fn handle_provider_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
+fn opens_provider_settings(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Char('s') && modifiers.contains(KeyModifiers::CONTROL)
+}
+
+pub(super) async fn handle_provider_menu_key(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Result<()> {
+    if opens_provider_settings(code, modifiers) {
+        close_footer_menus(app);
+        super::open_settings(app).await;
+        return Ok(());
+    }
     if code == KeyCode::Esc {
         close_footer_menus(app);
         return Ok(());
@@ -698,9 +775,13 @@ pub(super) async fn handle_footer_mouse(
 /// Routes one key to the open footer picker. A key the picker does not use
 /// dismisses it the same way a click outside the frame does, so the next
 /// keystroke reaches the composer instead of vanishing behind the popup.
-pub(super) async fn handle_footer_menu_key(app: &mut App, code: KeyCode) -> Result<EventOutcome> {
+pub(super) async fn handle_footer_menu_key(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Result<EventOutcome> {
     let handled = if app.provider_menu_open {
-        provider_menu_key_handled(code)
+        provider_menu_key_handled(code, modifiers)
     } else if app.model_menu_open {
         model_menu_key_handled(code)
     } else {
@@ -711,7 +792,7 @@ pub(super) async fn handle_footer_menu_key(app: &mut App, code: KeyCode) -> Resu
         return Ok(EventOutcome::redraw());
     }
     if app.provider_menu_open {
-        handle_provider_menu_key(app, code).await?;
+        handle_provider_menu_key(app, code, modifiers).await?;
     } else if app.model_menu_open {
         handle_model_menu_key(app, code).await?;
     } else {

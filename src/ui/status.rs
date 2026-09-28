@@ -46,7 +46,7 @@ pub(super) fn draw_input(
         ),
         area,
     );
-    if !app.current.busy && app.settings.is_none() && !app.has_pending_approval() {
+    if !app.current.busy && app.provider_editor.is_none() && !app.has_pending_approval() {
         let cursor_x = area.x + 1 + viewport.cursor_column as u16;
         let cursor_y = area.y + 1 + viewport.cursor_row.min(area.height.saturating_sub(3));
         frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), cursor_y));
@@ -72,10 +72,10 @@ pub(super) fn draw_footer(
     }
     frame.render_widget(Paragraph::new(lines), area);
     app.thinking_control_rect = thinking_control_rect(area, view);
-    (app.provider_control_rect, app.model_control_rect) = provider_model_rects(area, view, app);
+    (app.provider_control_rect, app.model_control_rect) = provider_model_rects(area, view);
 }
 
-fn provider_model_rects(area: Rect, view: &UiViewModel, app: &App) -> (Option<Rect>, Option<Rect>) {
+fn provider_model_rects(area: Rect, view: &UiViewModel) -> (Option<Rect>, Option<Rect>) {
     let Some(secondary) = view.footer.secondary.as_ref() else {
         return (None, None);
     };
@@ -83,33 +83,30 @@ fn provider_model_rects(area: Rect, view: &UiViewModel, app: &App) -> (Option<Re
     let right_width = segment_width(&right);
     let left_budget = (area.width as usize)
         .saturating_sub(right_width.saturating_add(usize::from(right_width > 0)));
-    let left = clip_segments(&secondary.left, left_budget);
-    let Some(text) = left.first().map(|segment| segment.text.as_str()) else {
-        return (None, None);
-    };
-    let prefix = format!("{} · ", mode_label(app.current.mode));
-    if !text.starts_with(&prefix) || area.height < 2 {
+    let left = clip_segments_with_fit(&secondary.left, left_budget);
+    if area.height < 2 {
         return (None, None);
     }
-    let prefix_width = UnicodeWidthStr::width(prefix.as_str()) as u16;
-    let visible_width = UnicodeWidthStr::width(text) as u16;
-    let provider_width = UnicodeWidthStr::width(app.provider_label().as_str()) as u16;
-    let separator_width = UnicodeWidthStr::width(" · ") as u16;
-    let model_width = UnicodeWidthStr::width(app.model_name()) as u16;
-    let provider_x = area.x.saturating_add(prefix_width);
-    let model_x = provider_x
-        .saturating_add(provider_width)
-        .saturating_add(separator_width);
-    let provider = (provider_width > 0
-        && visible_width >= prefix_width.saturating_add(provider_width))
-    .then(|| Rect::new(provider_x, area.y.saturating_add(1), provider_width, 1));
-    let model = (model_width > 0
-        && visible_width
-            >= prefix_width
-                .saturating_add(provider_width)
-                .saturating_add(separator_width)
-                .saturating_add(model_width))
-    .then(|| Rect::new(model_x, area.y.saturating_add(1), model_width, 1));
+    // The painter lays these segments out from the footer's left edge, so
+    // walking the same clipped output reproduces that layout exactly instead of
+    // re-deriving offsets from the assembled text. Slot 0 is the provider pill
+    // and slot 2 the model; a slot only becomes a control when its text was
+    // painted whole.
+    let mut column = area.x;
+    let mut provider = None;
+    let mut model = None;
+    for (index, (segment, whole)) in left.iter().enumerate() {
+        let width = UnicodeWidthStr::width(segment.text.as_str()) as u16;
+        if *whole && width > 0 {
+            let rect = Rect::new(column, area.y.saturating_add(1), width, 1);
+            match index {
+                0 => provider = Some(rect),
+                2 => model = Some(rect),
+                _ => {}
+            }
+        }
+        column = column.saturating_add(width);
+    }
     (provider, model)
 }
 
@@ -142,12 +139,15 @@ pub(super) fn draw_provider_menu(
             )
         })
         .collect::<Vec<_>>();
+    // Each painted row is `"{marker} {label:<14} {state}"` inside a bordered
+    // popup: the marker column and both borders are part of the budget, so the
+    // widest row plus four is the width that shows a row unabridged.
     let content_width = rows
         .iter()
         .map(|row| UnicodeWidthStr::width(row.as_str()))
         .max()
         .unwrap_or(18)
-        .saturating_add(3) as u16;
+        .saturating_add(4) as u16;
     let width = content_width.clamp(20, 40).min(screen.width);
     let control = app
         .provider_control_rect
@@ -155,7 +155,8 @@ pub(super) fn draw_provider_menu(
     let selected = app
         .provider_menu_selected
         .min(choices.len().saturating_sub(1));
-    let picker = PickerGeometry::new(screen, footer, control.x, width, choices.len(), selected);
+    let picker =
+        PickerGeometry::new_with_action(screen, footer, control.x, width, choices.len(), selected);
     app.provider_menu_geometry = Some(picker);
     let items = rows
         .iter()
@@ -176,14 +177,42 @@ pub(super) fn draw_provider_menu(
         .collect::<Vec<_>>();
     frame.render_widget(Clear, picker.area);
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title(" 选择供应商 ↑↓ Enter Esc ")
-                .borders(Borders::ALL)
-                .border_style(theme.focus_border),
-        ),
+        Block::default()
+            .title(" 供应商 ↑↓ 选择 · Enter 应用 ")
+            .borders(Borders::ALL)
+            .border_style(theme.focus_border),
         picker.area,
     );
+    // The list and the pinned action row share the popup's inner area, so the
+    // item rows are drawn into exactly `visible` rows and the action row fills
+    // the one the list was never given.
+    let inner = picker.inner();
+    frame.render_widget(
+        List::new(items),
+        Rect::new(inner.x, inner.y, inner.width, picker.visible as u16),
+    );
+    if let Some(action) = picker.action {
+        frame.render_widget(provider_settings_row(action, theme), action);
+    }
+}
+
+/// The provider picker's pinned entry into the full settings panel. Painted and
+/// hit-tested from the same geometry slot, so the row that advertises `Ctrl+S`
+/// is the row a click resolves.
+pub(super) fn provider_settings_row(action: Rect, theme: &UiTheme) -> Paragraph<'static> {
+    const LABEL: &str = "⚙ 供应商设置…";
+    const SHORTCUT: &str = "Ctrl+S";
+    let gap = (action.width as usize).saturating_sub(
+        UnicodeWidthStr::width(LABEL)
+            .saturating_add(UnicodeWidthStr::width(SHORTCUT))
+            .saturating_add(2),
+    );
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!(" {LABEL}"), theme.style(VisualRole::Accent)),
+        Span::styled(" ".repeat(gap), theme.style(VisualRole::Muted)),
+        Span::styled(SHORTCUT, theme.strong(VisualRole::Shortcut)),
+        Span::styled(" ", theme.style(VisualRole::Muted)),
+    ]))
 }
 
 pub(super) fn draw_model_menu(
@@ -388,6 +417,19 @@ fn footer_line(view: &FooterLine, width: usize, theme: &UiTheme) -> Line<'static
 }
 
 fn clip_segments(segments: &[UiSegment], width: usize) -> Vec<UiSegment> {
+    clip_segments_with_fit(segments, width)
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect()
+}
+
+/// [`clip_segments`] plus, per painted segment, whether it was painted whole.
+///
+/// The painter and every hit-test read this one function, so a control's
+/// rectangle is always derived from the text the frame actually drew. A segment
+/// cut short by the width budget reports `false` and therefore gets no
+/// rectangle: a clipped label must never open a picker.
+fn clip_segments_with_fit(segments: &[UiSegment], width: usize) -> Vec<(UiSegment, bool)> {
     let mut output = Vec::new();
     let mut remaining = width;
     for segment in segments {
@@ -396,7 +438,7 @@ fn clip_segments(segments: &[UiSegment], width: usize) -> Vec<UiSegment> {
         }
         let segment_width = UnicodeWidthStr::width(segment.text.as_str());
         if segment_width <= remaining {
-            output.push(segment.clone());
+            output.push((segment.clone(), true));
             remaining -= segment_width;
             continue;
         }
@@ -411,10 +453,13 @@ fn clip_segments(segments: &[UiSegment], width: usize) -> Vec<UiSegment> {
             used = used.saturating_add(grapheme_width);
         }
         if !text.is_empty() {
-            output.push(UiSegment {
-                text,
-                role: segment.role,
-            });
+            output.push((
+                UiSegment {
+                    text,
+                    role: segment.role,
+                },
+                false,
+            ));
         }
         break;
     }

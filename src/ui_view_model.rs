@@ -229,6 +229,10 @@ pub fn activity_view(app: &App) -> ActivityView {
         (ActivityState::Success, "✓", "已完成".into())
     } else if app.current.status.contains("已取消") {
         (ActivityState::Cancelled, "■", "已取消".into())
+    } else if app.provider_needs_key() {
+        // Only reachable once nothing else is happening, so a busy, failed or
+        // finished turn always outranks the configuration reminder.
+        (ActivityState::Warning, "!", "供应商未配置密钥".into())
     } else {
         (ActivityState::Idle, "○", "就绪".into())
     };
@@ -261,10 +265,11 @@ fn supplemental_status(status: &str, activity: &str) -> Option<String> {
 }
 
 pub fn contextual_shortcuts(app: &App) -> Vec<ShortcutHint> {
-    if app.settings.is_some() {
+    if app.provider_editor.is_some() {
         return vec![
-            hint("Tab", "切换", 3),
-            hint("Enter", "保存", 2),
+            hint("Tab", "切换窗格", 4),
+            hint("Enter", "打开", 3),
+            hint("Ctrl+S", "应用", 2),
             hint("Esc", "返回", 1),
         ];
     }
@@ -289,12 +294,27 @@ pub fn contextual_shortcuts(app: &App) -> Vec<ShortcutHint> {
         return vec![hint("Esc", "取消", 1)];
     }
     if !app.current.follow_output {
-        return vec![hint("Ctrl+L", "回到底部", 1), hint("Enter", "发送", 3)];
+        return vec![
+            hint("Ctrl+L", "回到底部", 1),
+            hint("Enter", "发送", 2),
+            hint("Ctrl+S", "供应商设置", 3),
+        ];
     }
+    // The provider hint only appears where `Ctrl+S` actually works: the global
+    // handler refuses to open settings while a request is running, so the busy
+    // and approval states above advertise only what they accept.
     if app.input.is_empty() {
-        vec![hint("Enter", "发送", 1), hint("Ctrl+P/X", "命令", 2)]
+        vec![
+            hint("Enter", "发送", 1),
+            hint("Ctrl+S", "供应商设置", 2),
+            hint("Ctrl+P/X", "命令", 3),
+        ]
     } else {
-        vec![hint("Enter", "发送", 1), hint("Shift+Enter", "换行", 2)]
+        vec![
+            hint("Enter", "发送", 1),
+            hint("Ctrl+S", "供应商设置", 2),
+            hint("Shift+Enter", "换行", 3),
+        ]
     }
 }
 
@@ -366,7 +386,7 @@ impl UiViewModel {
             label: thinking_control_label(app, &columns),
             enabled: !app.current.busy
                 && !app.has_pending_approval()
-                && app.settings.is_none()
+                && app.provider_editor.is_none()
                 && app.palette.is_none(),
             columns,
         };
@@ -406,11 +426,12 @@ impl UiViewModel {
                     right: Vec::new(),
                 }
             } else {
+                let provider = app.provider_label();
                 FooterLine {
                     left: metadata_segments(
-                        app.current.mode,
-                        &app.provider_label(),
+                        &provider,
                         app.model_name(),
+                        app.provider_needs_key(),
                         density,
                     ),
                     right: thinking_segments(&thinking, &context, density),
@@ -507,21 +528,50 @@ fn shortcut_segments(hints: &[ShortcutHint]) -> Vec<UiSegment> {
     output
 }
 
+/// Footer metadata, split into exactly the segments the painter emits so the
+/// mouse hit-test can walk that same output instead of re-deriving offsets from
+/// an assembled string. Segment 0 is the provider pill — the control that opens
+/// the provider picker — and segment 2 is the model. The mode is deliberately
+/// absent: it already sits in the input block's title, which is itself the
+/// clickable mode control, and repeating it here only spent footer width.
+///
+/// `needs_key` marks a provider whose API key the core cannot resolve yet; the
+/// pill says so instead of leaving the user to discover it from a failed
+/// request. The compact density keeps the pill and drops both the model and the
+/// warning suffix: the activity line already spells the warning out, while the
+/// pill itself keeps the accent that marks it as a control — and a suffix there
+/// would push the pill past the left budget, which is exactly how the narrow
+/// terminal used to lose its provider entry.
 fn metadata_segments(
-    mode: AgentMode,
     provider: &str,
     model: &str,
+    needs_key: bool,
     density: Density,
 ) -> Vec<UiSegment> {
-    let text = match density {
-        Density::Wide => format!("{} · {provider} · {model}", mode_label(mode)),
-        Density::Standard => format!("{} · {provider} · {model}", mode_label(mode)),
-        Density::Compact => mode_label(mode).to_owned(),
-    };
-    vec![UiSegment {
-        text,
-        role: VisualRole::Secondary,
-    }]
+    let compact = density == Density::Compact;
+    let mut pill = format!("⚙ {provider} ▾");
+    if needs_key && !compact {
+        pill.push_str(" · 需要 API Key");
+    }
+    let mut segments = vec![UiSegment {
+        text: pill,
+        role: if needs_key {
+            VisualRole::Warning
+        } else {
+            VisualRole::Accent
+        },
+    }];
+    if !compact && !model.is_empty() {
+        segments.push(UiSegment {
+            text: " · ".into(),
+            role: VisualRole::Muted,
+        });
+        segments.push(UiSegment {
+            text: model.to_owned(),
+            role: VisualRole::Secondary,
+        });
+    }
+    segments
 }
 
 fn context_segments(context: &ContextView, density: Density) -> Vec<UiSegment> {

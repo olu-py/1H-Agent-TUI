@@ -223,16 +223,14 @@ pub(super) async fn build_app(
         config,
         provider_settings: None,
         provider_models: ProviderModelsState::default(),
+        provider_hint_shown: false,
         model_refresh_tx,
         model_refresh_rx: Some(model_refresh_rx),
         model_refresh_task: None,
         model_refresh_generation: 0,
-        settings_field_index: 0,
-        context_window_input: String::new(),
         input: InputBuffer::new(),
         context_meter_enabled,
-        settings: None,
-        settings_rect: None,
+        provider_editor: None,
         palette: None,
         thinking_menu_open: false,
         thinking_control_rect: None,
@@ -275,6 +273,9 @@ pub(super) async fn build_app(
     let _ = refresh_provider_settings(&mut app).await;
     let _ = load_provider_models(&mut app, false).await;
     app.load_history().await?;
+    // First screen: a fresh transcript with no resolvable key gets the
+    // onboarding entry, now that the authoritative key state is known.
+    sync_provider_hint(&mut app);
     Ok(app)
 }
 

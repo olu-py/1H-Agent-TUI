@@ -28,7 +28,7 @@ use crate::{
     input::input_cursor_viewport,
     output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
     secrets,
-    settings::{FIELDS, SettingsField, SettingsForm, SettingsState},
+    settings::SettingsField,
     storage::SessionSummary,
     ui_layout::{Density, HeightClass, PickerGeometry, compute_layout, message_block},
     ui_theme::{UiTheme, VisualRole},
@@ -72,7 +72,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         &theme,
     );
     draw_input(frame, layout.input, app, &view.input, &theme);
-    if !app.file_suggestions.is_empty() && app.palette.is_none() && app.settings.is_none() {
+    if !app.file_suggestions.is_empty() && app.palette.is_none() && app.provider_editor.is_none() {
         draw_file_suggestions(frame, layout.input, app);
     }
     draw_footer(frame, layout.footer, &view, app, &theme);
@@ -91,13 +91,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         app.model_menu_geometry = None;
     }
-    app.settings_rect = app.settings.as_ref().map(|settings| match settings {
-        SettingsState::List(_) => centered_rect(78, 20, area),
-        SettingsState::Templates(_) => centered_rect(68, 18, area),
-        SettingsState::Form(_) => centered_rect(88, 24, area),
-    });
-    if let Some(settings) = &app.settings {
-        draw_settings(frame, area, settings, app, &theme);
+    if app.provider_editor.is_some() {
+        // The editor is taken out for the draw so it can write its own hit
+        // rectangles while the frame reads the rest of the facade.
+        if let Some(mut editor) = app.provider_editor.take() {
+            draw_provider_editor(frame, area, app, &mut editor, &theme);
+            app.provider_editor = Some(editor);
+        }
     }
     if let Some(palette) = &app.palette {
         draw_palette(frame, area, palette, &theme);
@@ -109,10 +109,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
 mod modal;
 #[cfg(test)]
-use modal::{SettingsRow, approval_lines, palette_item_text, settings_rows};
+use crate::app::EDITOR_FIELDS;
+#[cfg(test)]
+use crate::settings::FIELDS;
+#[cfg(test)]
+use modal::{approval_lines, palette_item_text};
 use modal::{
-    argument_label, centered_rect, draw_approval, draw_file_suggestions, draw_palette,
-    draw_settings, fit_text, human_argument,
+    argument_label, draw_approval, draw_file_suggestions, draw_palette, draw_provider_editor,
+    fit_text, human_argument,
 };
 
 mod chat;

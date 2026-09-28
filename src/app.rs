@@ -34,7 +34,7 @@ use protium_core::{
     secrets,
     security::Workspace,
     service::{AppHandle, AppService, CoreConfig},
-    settings::{FIELDS, SettingsField, SettingsForm, SettingsState},
+    settings::{FIELDS, SettingsField, SettingsForm},
     storage::SessionSummary,
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
@@ -51,8 +51,8 @@ use crate::{
 #[path = "app/commands.rs"]
 mod command_ops;
 use command_ops::{
-    apply_file_completion, handle_palette_key, next_mode, open_palette, session_switch_direction,
-    todo_status_from_wire, update_file_suggestions,
+    apply_file_completion, handle_palette_key, next_mode, open_palette, palette_key_handled,
+    session_switch_direction, todo_status_from_wire, update_file_suggestions,
 };
 #[cfg(test)]
 use command_ops::{command_to_text, todo_to_text};
@@ -60,7 +60,7 @@ use command_ops::{command_to_text, todo_to_text};
 mod event_loop;
 mod input;
 mod provider;
-mod settings;
+mod provider_editor;
 pub use event_loop::run;
 #[cfg(test)]
 use event_loop::{build_app, should_coalesce_stream_redraw};
@@ -69,11 +69,19 @@ use input::handle_terminal_event;
 use provider::{
     FooterMenu, apply_model_refresh_result, handle_footer_menu_key, handle_footer_mouse,
     load_provider_models, open_footer_menu, point_in_rect, refresh_provider_settings,
+    sync_provider_hint,
 };
 pub(crate) use provider::{model_choices, provider_choices};
-use settings::{
-    handle_settings_key, open_selected_profile, open_selected_template, open_settings,
-    open_template_picker, palette_key_handled, paste_text_into_settings, settings_key_handled,
+/// The panel's own types are re-exported at crate scope because the renderer
+/// lives in `ui::modal`: one definition, one path, no second copy of the row
+/// model.
+pub(crate) use provider_editor::{
+    EDITOR_FIELDS, EditorAction, EditorField, EditorPane, ProviderEditor,
+};
+/// The panel's entry points stay inside `app`: they hand back the crate-private
+/// `EventOutcome`, which only this module tree needs.
+use provider_editor::{
+    editor_key_handled, handle_editor_key, handle_editor_mouse, open_settings, paste_into_editor,
 };
 
 const MOUSE_WHEEL_SCROLL_LINES: isize = 1;
@@ -189,6 +197,9 @@ pub struct App {
     pub provider_settings: Option<ProviderSettingsDto>,
     /// Last `provider_models(false)` answer for the active preset.
     pub provider_models: ProviderModelsState,
+    /// One-shot guard for the provider onboarding entry: it is pushed at most
+    /// once per run, on a fresh transcript whose provider has no resolved key.
+    pub provider_hint_shown: bool,
     /// Background model-refresh result channel (sender side).
     pub(crate) model_refresh_tx: tokio::sync::mpsc::Sender<ModelRefreshResult>,
     /// Background model-refresh result channel (receiver side; taken by the
@@ -200,16 +211,12 @@ pub struct App {
     /// Monotonic identity for refresh requests; results from older provider
     /// state are ignored even if cancellation races with completion.
     model_refresh_generation: u64,
-    /// TUI-only settings selection: the core `FIELDS` rows followed by the
-    /// synthetic context-window override row.
-    pub settings_field_index: usize,
-    /// Write-only context-window override buffer. Empty means "inherit the
-    /// merged profile value"; digits are passed to the core, which clamps.
-    pub context_window_input: String,
+    /// TUI-only provider panel state: the highlighted profile, the core's
+    /// `SettingsForm` draft, and the rectangles the frame painted for it. All of
+    /// it is dropped together when the panel closes.
+    pub(crate) provider_editor: Option<ProviderEditor>,
     pub input: InputBuffer,
     pub context_meter_enabled: bool,
-    pub settings: Option<SettingsState>,
-    pub settings_rect: Option<Rect>,
     pub palette: Option<CommandPaletteState>,
     pub thinking_menu_open: bool,
     pub thinking_control_rect: Option<Rect>,
@@ -269,7 +276,7 @@ async fn handle_navigation_mouse(
     mouse: crossterm::event::MouseEvent,
 ) -> Result<Option<EventOutcome>> {
     if mouse.kind != MouseEventKind::Down(MouseButton::Left)
-        || app.settings.is_some()
+        || app.provider_editor.is_some()
         || app.palette.is_some()
         || app.has_pending_approval()
     {
@@ -907,6 +914,9 @@ impl App {
     pub(crate) async fn sync_all(&mut self) -> Result<()> {
         self.sync_snapshot().await?;
         self.load_history().await?;
+        // The transcript may have just been rebuilt from the core; the
+        // onboarding entry is derived from it, so it converges here too.
+        sync_provider_hint(self);
         Ok(())
     }
 }

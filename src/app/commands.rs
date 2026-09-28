@@ -60,6 +60,18 @@ impl App {
         self.active_model()
     }
 
+    /// True when the core cannot resolve an API key for the active provider yet.
+    /// Absence from `connected` means "not resolved so far", not "never
+    /// configured", so this only drives a prompt; it never blocks a submit. It
+    /// also stays false until the first `provider_settings()` read lands, so a
+    /// not-yet-known state is never reported as a missing key.
+    pub(crate) fn provider_needs_key(&self) -> bool {
+        let active = self.active_provider_id();
+        self.provider_settings
+            .as_ref()
+            .is_some_and(|settings| !settings.connected.iter().any(|id| id == &active))
+    }
+
     pub(crate) fn thinking_level(&self) -> ThinkingLevel {
         self.config.provider.thinking_level
     }
@@ -258,6 +270,27 @@ impl App {
         if id == self.active_provider_id() {
             return Ok(());
         }
+        // A provider the core cannot resolve a key for cannot be switched to:
+        // `set_provider` would reject it and leave the user staring at a status
+        // line. Sending them to the row that fixes it is the same decision the
+        // switcher greys the row for.
+        if self
+            .provider_settings
+            .as_ref()
+            .is_some_and(|settings| !settings.connected.iter().any(|entry| entry == &id))
+        {
+            let label = provider_choices(self)
+                .into_iter()
+                .find(|choice| choice.id == id)
+                .map(|choice| choice.label)
+                .unwrap_or_else(|| id.clone());
+            // The panel sets its own generic status; the reason this entry was
+            // redirected is written after it, so the user is told *why* they
+            // landed here rather than only where.
+            super::provider_editor::open_settings_at(self, Some(&id)).await;
+            self.current.status = format!("{label} 尚未配置 API Key，已定位到该供应商");
+            return Ok(());
+        }
         self.cancel_model_refresh();
         let template = self
             .provider_settings
@@ -336,7 +369,7 @@ impl App {
                 self.current.push_entry(DisplayEntry {
                     kind: DisplayKind::System,
                     content: DisplayContent::Markdown(
-                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/uncompact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/memory [search|add|candidate|confirm|edit|delete]` `/diff`\n`/plan` `/build` `/explore` `/cluster` `/model` `/provider` `/agent`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell\n\n页脚选择器（也可点击页脚标签）：Alt+P 供应商 | Alt+M 模型 | Alt+T 思考强度\n↑/↓ 选择 | ←/→ 切换强度与预算列 | Enter 应用 | Esc 取消 | r 刷新模型\n\n搜索后端（DuckDuckGo/Bing）来自 config 的 [runtime].search_backend，TUI 不另存配置"
+                        "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/uncompact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/memory [search|add|candidate|confirm|edit|delete]` `/diff`\n`/plan` `/build` `/explore` `/cluster` `/model` `/provider` `/agent`\n\nCtrl+S 或 `/provider` 打开供应商设置（供应商、密钥、模型与上下文窗口）\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell\n\n页脚选择器（也可点击页脚标签）：Alt+P 供应商 | Alt+M 模型 | Alt+T 思考强度\n↑/↓ 选择 | ←/→ 切换强度与预算列 | Enter 应用 | Esc 取消 | r 刷新模型\n\n搜索后端（DuckDuckGo/Bing）来自 config 的 [runtime].search_backend，TUI 不另存配置"
                             .into(),
                     ),
                 });
@@ -497,6 +530,15 @@ pub(super) fn open_palette(app: &mut App) {
         selected: 0,
     });
     app.current.status = "命令面板 | 输入筛选 | ↑/↓ 选择 | Enter 执行 | Esc 关闭".into();
+}
+
+/// Keys the command palette consumes. Anything else falls through to the global
+/// bindings, so the palette never swallows a shortcut it does not use.
+pub(super) fn palette_key_handled(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    matches!(
+        code,
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::Backspace
+    ) || matches!(code, KeyCode::Char(_) if !modifiers.contains(KeyModifiers::CONTROL))
 }
 
 pub(super) async fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
