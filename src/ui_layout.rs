@@ -163,6 +163,11 @@ pub struct PickerGeometry {
     pub scroll: usize,
     /// Number of painted item rows.
     pub visible: usize,
+    /// Pinned bottom inner row carrying a non-scrolling action entry (the
+    /// provider picker's "供应商设置" shortcut). It is not an item, so
+    /// [`PickerGeometry::item_at`] never addresses it and the hit-test resolves
+    /// it from this rectangle alone.
+    pub action: Option<Rect>,
 }
 
 impl PickerGeometry {
@@ -176,26 +181,86 @@ impl PickerGeometry {
         items: usize,
         selected: usize,
     ) -> Self {
+        Self::build(screen, footer.y, anchor_x, width, items, selected, false)
+    }
+
+    /// A window that additionally pins one action row under the item list. The
+    /// row keeps its place while the list scrolls and costs the list one row of
+    /// height, so painter and hit-test still share a single item window.
+    pub fn new_with_action(
+        screen: Rect,
+        footer: Rect,
+        anchor_x: u16,
+        width: u16,
+        items: usize,
+        selected: usize,
+    ) -> Self {
+        Self::build(screen, footer.y, anchor_x, width, items, selected, true)
+    }
+
+    /// A window pinned to the bottom of `screen` rather than above a control:
+    /// the in-panel model picker floats over the panel it was opened from and
+    /// has no footer control to sit above, so it takes the whole height.
+    pub fn floating(
+        screen: Rect,
+        anchor_x: u16,
+        width: u16,
+        items: usize,
+        selected: usize,
+    ) -> Self {
+        Self::build(
+            screen,
+            screen.bottom(),
+            anchor_x,
+            width,
+            items,
+            selected,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        screen: Rect,
+        bottom: u16,
+        anchor_x: u16,
+        width: u16,
+        items: usize,
+        selected: usize,
+        action: bool,
+    ) -> Self {
         let width = width.min(screen.width);
-        let rows = footer.y.saturating_sub(screen.y) as usize;
+        let rows = bottom.saturating_sub(screen.y) as usize;
+        let action_rows = usize::from(action);
         let visible = items
             .min(PICKER_MAX_ROWS)
-            .min(rows.saturating_sub(usize::from(PICKER_BORDER_ROWS)));
+            .min(rows.saturating_sub(usize::from(PICKER_BORDER_ROWS) + action_rows));
         let scroll = selected
             .saturating_sub(visible.saturating_sub(1))
             .min(items.saturating_sub(visible));
-        let height = (visible as u16).saturating_add(PICKER_BORDER_ROWS);
+        let height = (visible + action_rows) as u16 + PICKER_BORDER_ROWS;
+        let area = Rect::new(
+            anchor_x
+                .max(screen.x)
+                .min(screen.right().saturating_sub(width)),
+            bottom.saturating_sub(height),
+            width,
+            height,
+        );
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let action_rect = action.then(|| {
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(visible as u16),
+                inner.width,
+                1,
+            )
+        });
         Self {
-            area: Rect::new(
-                anchor_x
-                    .max(screen.x)
-                    .min(screen.right().saturating_sub(width)),
-                footer.y.saturating_sub(height),
-                width,
-                height,
-            ),
+            area,
             scroll,
             visible,
+            action: action_rect,
         }
     }
 
@@ -270,6 +335,59 @@ mod picker_geometry_tests {
         assert_eq!(
             picker.item_at(inner.right() - 1, inner.bottom() - 1),
             Some(19)
+        );
+    }
+
+    #[test]
+    fn a_pinned_action_row_never_resolves_an_item_and_never_covers_the_footer() {
+        // Room to spare: the item window is already capped by PICKER_MAX_ROWS,
+        // so the pinned row makes the popup one row taller instead of shortening
+        // the list.
+        let screen = Rect::new(0, 0, 100, 20);
+        let footer = Rect::new(0, 18, 100, 2);
+        let plain = PickerGeometry::new(screen, footer, 40, 24, 20, 19);
+        let tall = PickerGeometry::new_with_action(screen, footer, 40, 24, 20, 19);
+        assert_eq!(
+            plain.visible, PICKER_MAX_ROWS,
+            "the fixture must be capped by the row limit, not by the screen"
+        );
+        assert_eq!(tall.visible, plain.visible);
+        assert_eq!(tall.area.height, plain.area.height + 1);
+
+        // Tight screen: the list is capped by the height, so the pinned row now
+        // comes out of the item window and the popup keeps its height.
+        let short_footer = Rect::new(0, 12, 100, 2);
+        let plain_short = PickerGeometry::new(screen, short_footer, 40, 24, 20, 19);
+        let short = PickerGeometry::new_with_action(screen, short_footer, 40, 24, 20, 19);
+        assert!(plain_short.visible < PICKER_MAX_ROWS);
+        assert_eq!(short.visible, plain_short.visible - 1);
+        assert_eq!(short.area.height, plain_short.area.height);
+
+        for picker in [tall, short] {
+            assert_eq!(picker.area.bottom(), picker.area.y + picker.area.height);
+            assert!(
+                picker.area.bottom() <= footer.y,
+                "the popup grows upward, never over the footer"
+            );
+            let inner = picker.inner();
+            let action = picker.action.expect("an action row is reserved");
+            assert_eq!(action.y, inner.y + picker.visible as u16);
+            assert_eq!(action.bottom(), inner.bottom());
+            assert_eq!(action.width, inner.width);
+            for column in action.x..action.right() {
+                assert_eq!(
+                    picker.item_at(column, action.y),
+                    None,
+                    "no cell of the action row is an item row"
+                );
+            }
+        }
+
+        assert!(
+            PickerGeometry::new(screen, footer, 40, 24, 5, 0)
+                .action
+                .is_none(),
+            "pickers without an entry reserve nothing"
         );
     }
 

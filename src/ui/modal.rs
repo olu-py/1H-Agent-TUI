@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::app::{EDITOR_FIELDS, EditorAction, EditorField, EditorPane, ProviderEditor};
+
 pub(super) fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) {
     let popup = centered_rect(76, 18, area);
     let approval = app.pending_approval().expect("approval exists");
@@ -222,369 +224,617 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// One row in the settings list: a section header, an editable field, or a
-/// breathing-space spacer. Derived from the `FIELDS` registry.
-pub(super) enum SettingsRow {
-    Section(&'static str),
-    Field(SettingsField),
-    /// TUI-only display-name input for custom providers, rendered right after
-    /// the read-only template row. The core DTO carries `name`, but the shared
-    /// `FIELDS` registry has no slot for it, so it is edited here and passed to
-    /// `set_provider_profile`.
-    Name,
-    /// TUI-only context-window override; the core DTO does not carry it, so it
-    /// is edited through the same form and passed to `set_provider_profile`.
-    ContextWindow,
-    Spacer,
-}
+/// Width of the label column in the editor's field pane.
+const EDITOR_LABEL_COLUMNS: usize = 12;
 
-/// TUI row index of the synthetic provider-name row (right after Preset).
-fn name_row() -> usize {
-    1
-}
-
-/// TUI row index of the synthetic context-window override. Rendered right
-/// after Thinking, so ApiKey shifts by one more.
-fn context_window_row() -> usize {
-    FIELDS.len()
-}
-
-/// TUI row index for a core field. The name row shifts every field after Preset
-/// by one, and ApiKey is shifted once more by the context-window row.
-fn tui_field_row(field: SettingsField) -> usize {
-    let index = FIELDS
+/// The widest status the current rows can print. The provider pane reserves
+/// exactly this column and gives the label the rest, so a longer badge (for
+/// example the `当前 已配置 ●` row, which is one cell wider than
+/// `需要 API Key`) costs the label characters instead of moving the divider.
+fn provider_status_columns(editor: &ProviderEditor) -> usize {
+    editor
+        .rows
         .iter()
-        .position(|spec| spec.field == field)
-        .unwrap_or(0);
-    let name_shift = usize::from(index >= name_row());
-    let window_shift = usize::from(index >= FIELDS.len().saturating_sub(1));
-    index + name_shift + window_shift
+        .map(|row| {
+            let badge = row.badge();
+            if badge.is_empty() {
+                UnicodeWidthStr::width(row.key_state())
+            } else {
+                UnicodeWidthStr::width(badge.as_str())
+            }
+        })
+        .max()
+        .unwrap_or(0)
 }
 
-pub(super) fn settings_rows() -> Vec<SettingsRow> {
-    let mut rows = Vec::with_capacity(FIELDS.len() * 2 + 5);
-    let mut last_section = None;
-    for spec in FIELDS {
-        if last_section != Some(spec.section) {
-            last_section = Some(spec.section);
-            rows.push(SettingsRow::Section(spec.section));
-            rows.push(SettingsRow::Spacer);
-        }
-        rows.push(SettingsRow::Field(spec.field));
-        if spec.field == SettingsField::Preset {
-            // The custom display name follows the template row.
-            rows.push(SettingsRow::Name);
-        }
-        if spec.field == SettingsField::Thinking {
-            // The override sits with the other advanced knobs, immediately
-            // after Thinking and before the write-only API key.
-            rows.push(SettingsRow::ContextWindow);
-        }
-        rows.push(SettingsRow::Spacer);
-    }
-    rows
-}
-
-const SETTINGS_LABEL_COLUMNS: usize = 12;
-
-pub(super) fn draw_settings(
+/// The provider panel: the providers on the left, the draft's fields on the
+/// right, and a pinned action row.
+///
+/// Every clickable row is painted and hit-tested in this one pass: the
+/// rectangles recorded here are the rows the frame actually drew, so a scrolled
+/// or clipped row can never resolve a click it does not show.
+pub(super) fn draw_provider_editor(
     frame: &mut Frame<'_>,
     area: Rect,
-    settings: &SettingsState,
     app: &App,
+    editor: &mut ProviderEditor,
     theme: &UiTheme,
 ) {
-    match settings {
-        SettingsState::List(list) => draw_provider_list(frame, area, list, theme),
-        SettingsState::Templates(templates) => {
-            draw_provider_templates(frame, area, templates, theme)
-        }
-        SettingsState::Form(form) => draw_provider_form(frame, area, form, app, theme),
-    }
-}
-
-fn draw_provider_list(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    list: &crate::settings::ProviderList,
-    theme: &UiTheme,
-) {
-    let popup = centered_rect(78, 20, area);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "  已连接的供应商",
-            theme.strong(VisualRole::Accent),
-        )),
-        Line::default(),
-    ];
-    for (index, provider) in list.providers.iter().enumerate() {
-        let selected = index == list.selected;
-        let current = if provider.id() == list.active {
-            " 当前"
-        } else {
-            ""
-        };
-        let status = if list.connected.contains(provider.id()) {
-            "已连接"
-        } else {
-            "需要 API Key"
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {} {:<20} {:<26} {status}{current}",
-                if selected { "›" } else { " " },
-                provider.display_label(),
-                provider.model
-            ),
-            if selected {
-                theme.selected
-            } else {
-                theme.style(VisualRole::Primary)
-            },
-        )));
-    }
-    let selected = list.selected == list.providers.len();
-    lines.extend([
-        Line::default(),
-        Line::from(Span::styled(
-            format!("  {} 添加供应商", if selected { "›" } else { " " }),
-            if selected {
-                theme.selected
-            } else {
-                theme.strong(VisualRole::Success)
-            },
-        )),
-        Line::default(),
-        Line::from(Span::styled(
-            "  ↑/↓ 选择  Enter 编辑或添加  Esc 关闭",
-            theme.style(VisualRole::Muted),
-        )),
-    ]);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(" 供应商连接 ")
-                .borders(Borders::ALL)
-                .border_style(theme.focus_border),
-        ),
-        popup,
-    );
-}
-
-fn draw_provider_templates(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    templates: &crate::settings::TemplateList,
-    theme: &UiTheme,
-) {
-    let popup = centered_rect(68, 18, area);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "  选择供应商模板",
-            theme.strong(VisualRole::Accent),
-        )),
-        Line::default(),
-    ];
-    if templates.presets.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  所有供应商模板均已添加",
-            theme.style(VisualRole::Muted),
-        )));
-    }
-    for (index, preset) in templates.presets.iter().enumerate() {
-        let selected = index == templates.selected;
-        lines.push(Line::from(Span::styled(
-            format!("  {} {}", if selected { "›" } else { " " }, preset.label()),
-            if selected {
-                theme.selected
-            } else {
-                theme.style(VisualRole::Primary)
-            },
-        )));
-    }
-    lines.extend([
-        Line::default(),
-        Line::from(Span::styled(
-            "  ↑/↓ 选择  Enter 继续  Esc 返回",
-            theme.style(VisualRole::Muted),
-        )),
-    ]);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(" 添加供应商 ")
-                .borders(Borders::ALL)
-                .border_style(theme.focus_border),
-        ),
-        popup,
-    );
-}
-
-fn draw_provider_form(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    form: &SettingsForm,
-    app: &App,
-    theme: &UiTheme,
-) {
-    let popup = centered_rect(88, 24, area);
+    let popup = centered_rect(92, 26, area);
     let inner = Block::bordered().inner(popup);
-    let footer_rows = 2usize;
-    let visible = (inner.height as usize).saturating_sub(footer_rows);
+    editor.rect = popup;
+    editor.row_rects = vec![Rect::default(); editor.rows.len() + 1];
+    editor.field_rects = vec![Rect::default(); EDITOR_FIELDS.len()];
+    editor.action_rects.clear();
+    editor.model_picker_rect = None;
 
-    let rows = settings_rows();
-    let selected_row = if app.settings_field_index == name_row() {
-        rows.iter()
-            .position(|row| matches!(row, SettingsRow::Name))
-            .unwrap_or(0)
-    } else if app.settings_field_index == context_window_row() {
-        rows.iter()
-            .position(|row| matches!(row, SettingsRow::ContextWindow))
-            .unwrap_or(0)
+    let footer_rows = 2u16.min(inner.height);
+    let body_height = inner.height.saturating_sub(footer_rows) as usize;
+    // Two panes need room for a label column *and* a value on each side. Below
+    // that the panel stacks them and shows the pane that holds the keyboard,
+    // rather than shrinking both into unusable slivers.
+    let two_pane = inner.width >= 88;
+    let (left_width, right_x, right_width) = if two_pane {
+        let left = (inner.width * 2 / 5)
+            .clamp(34, 44)
+            .min(inner.width.saturating_sub(40));
+        (
+            left,
+            inner.x.saturating_add(left).saturating_add(3),
+            inner.width - left - 3,
+        )
     } else {
-        rows.iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    SettingsRow::Field(field)
-                        if tui_field_row(*field) == app.settings_field_index
-                )
-            })
-            .unwrap_or(0)
+        (inner.width, inner.x, inner.width)
     };
-    let scroll = selected_row
-        .saturating_sub(visible.saturating_sub(1))
-        .min(rows.len().saturating_sub(visible));
+    let show_left = two_pane || editor.pane == EditorPane::Providers;
+    let show_right = two_pane || editor.pane == EditorPane::Fields;
 
-    let value_width = inner
-        .width
-        .saturating_sub(SETTINGS_LABEL_COLUMNS as u16 + 7) as usize;
-    let mut lines = Vec::with_capacity(visible + footer_rows);
-    for row in rows.iter().skip(scroll).take(visible) {
-        match row {
-            SettingsRow::Section(section) => {
-                let fill = inner
-                    .width
-                    .saturating_sub(UnicodeWidthStr::width(*section) as u16 + 6)
-                    .min(24) as usize;
-                lines.push(Line::from(Span::styled(
-                    format!("  ━━ {section} {}", "━".repeat(fill)),
-                    theme.strong(VisualRole::Accent),
-                )));
+    let label_columns = (left_width as usize)
+        .saturating_sub(4 + provider_status_columns(editor))
+        .max(8);
+    let left_lines = provider_row_lines(editor, theme, label_columns);
+    let right_lines = editor_field_lines(app, editor, theme, right_width);
+
+    let left_start = window_start(editor.selected_row, left_lines.len(), body_height);
+    let right_focus = right_lines
+        .iter()
+        .position(|(field, _)| *field == Some(editor.field_index))
+        .unwrap_or(0);
+    let right_start = window_start(right_focus, right_lines.len(), body_height);
+
+    // Each pane is rendered into its own rectangle. A row wider than its pane
+    // therefore clips inside that pane instead of shifting the divider between
+    // them — composing both panes into one line could only be kept aligned by
+    // padding, and a row one cell too wide silently broke it.
+    let mut left_visible: Vec<Line<'static>> = Vec::with_capacity(body_height);
+    let mut right_visible: Vec<Line<'static>> = Vec::with_capacity(body_height);
+    for row in 0..body_height {
+        if show_left {
+            let index = left_start + row;
+            match left_lines.get(index) {
+                Some(line) => {
+                    editor.row_rects[index] =
+                        Rect::new(inner.x, inner.y + row as u16, left_width, 1);
+                    left_visible.push(Line::from(line.clone()));
+                }
+                None => left_visible.push(Line::default()),
             }
-            SettingsRow::Name => {
-                let selected = app.settings_field_index == name_row();
-                let marker = if selected { "›" } else { " " };
-                let label = "名称";
-                let label_pad = " "
-                    .repeat(SETTINGS_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(label)));
-                let value = if form.provider.name.trim().is_empty() {
-                    "（内置/未命名）".to_owned()
-                } else {
-                    form.provider.name.clone()
-                };
-                let label_style = if selected {
-                    theme.selected
-                } else {
-                    theme.style(VisualRole::Primary)
-                };
-                let value_style = if selected {
-                    theme.selected
-                } else {
-                    theme.style(VisualRole::Secondary)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {marker} {label}{label_pad}"), label_style),
-                    Span::styled(
-                        format!("  {}", fit_text(value.as_str(), value_width)),
-                        value_style,
-                    ),
-                ]));
+        }
+        if show_right {
+            let index = right_start + row;
+            match right_lines.get(index) {
+                Some((field, line)) => {
+                    if let Some(field) = field {
+                        editor.field_rects[*field] =
+                            Rect::new(right_x, inner.y + row as u16, right_width, 1);
+                    }
+                    right_visible.push(Line::from(line.clone()));
+                }
+                None => right_visible.push(Line::default()),
             }
-            SettingsRow::ContextWindow => {
-                let selected = app.settings_field_index == context_window_row();
-                let marker = if selected { "›" } else { " " };
-                let label = "上下文窗口";
-                let label_pad = " "
-                    .repeat(SETTINGS_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(label)));
-                let value = if app.context_window_input.trim().is_empty() {
-                    "（继承）".to_owned()
-                } else {
-                    app.context_window_input.clone()
-                };
-                let label_style = if selected {
-                    theme.selected
-                } else {
-                    theme.style(VisualRole::Primary)
-                };
-                let value_style = if selected {
-                    theme.selected
-                } else {
-                    theme.style(VisualRole::Secondary)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {marker} {label}{label_pad}"), label_style),
-                    Span::styled(
-                        format!("  {}", fit_text(value.as_str(), value_width)),
-                        value_style,
-                    ),
-                ]));
-            }
-            SettingsRow::Field(field) => {
-                let spec = FIELDS.iter().find(|spec| spec.field == *field).unwrap();
-                let selected = app.settings_field_index == tui_field_row(*field);
-                let marker = if selected { "›" } else { " " };
-                let label_pad = " ".repeat(
-                    SETTINGS_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(spec.label)),
-                );
-                let value = form.value(*field);
-                let label_style = if selected {
-                    theme.selected
-                } else {
-                    theme.style(VisualRole::Primary)
-                };
-                let value_style = if selected {
-                    theme.selected
-                } else {
-                    theme.style(VisualRole::Secondary)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {marker} {}{label_pad}", spec.label), label_style),
-                    Span::styled(
-                        format!("  {}", fit_text(value.as_ref(), value_width)),
-                        value_style,
-                    ),
-                ]));
-            }
-            SettingsRow::Spacer => lines.push(Line::default()),
         }
     }
-    let divider = "─".repeat(inner.width.saturating_sub(2) as usize);
-    lines.push(Line::from(Span::styled(
-        format!("  {divider}"),
+
+    let divider_row = inner.y.saturating_add(body_height as u16);
+    let mut footer: Vec<Line<'static>> = Vec::new();
+    footer.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(inner.width.saturating_sub(2) as usize)),
         theme.style(VisualRole::Muted),
     )));
-    lines.push(Line::from(vec![
-        Span::styled("  ↑/↓ 选择  ", theme.strong(VisualRole::Success)),
-        Span::styled("←/→ 修改  ", theme.strong(VisualRole::Success)),
-        Span::styled("Enter 保存  ", theme.strong(VisualRole::Success)),
-        Span::styled("Ctrl+D 移除  ", theme.strong(VisualRole::Success)),
-        Span::styled("Esc 返回", theme.strong(VisualRole::Success)),
-    ]));
-    frame.render_widget(Clear, popup);
+    if editor.delete_confirm {
+        footer.push(Line::from(vec![
+            Span::styled("  确认删除？", theme.strong(VisualRole::Warning)),
+            Span::styled(
+                "该供应商的 API Key 会保留在系统钥匙串中  ",
+                theme.style(VisualRole::Muted),
+            ),
+            Span::styled("y 确认", theme.strong(VisualRole::Warning)),
+            Span::styled("    ", theme.style(VisualRole::Muted)),
+            Span::styled("n / Esc 取消", theme.strong(VisualRole::Shortcut)),
+        ]));
+    } else {
+        footer.push(Line::from(action_row(
+            editor,
+            theme,
+            divider_row.saturating_add(1),
+            inner,
+        )));
+    }
+
+    // A clear one cell *beyond* the panel, not just inside it: a wide grapheme
+    // painted by whatever sits underneath the panel makes ratatui skip the cell
+    // that follows it when it diffs the frame, so the panel's border cell beside
+    // it would keep the previous screen's half-glyph for as long as that widget
+    // keeps redrawing the character. Erasing the neighbour leaves a narrow blank
+    // there, which lets the border be diffed again.
+    frame.render_widget(Clear, expand_within(popup, 1, area));
+    let body_area = Rect::new(inner.x, inner.y, inner.width, body_height as u16);
+    if show_left {
+        frame.render_widget(
+            Paragraph::new(left_visible),
+            Rect::new(inner.x, inner.y, left_width, body_height as u16),
+        );
+    }
+    if two_pane {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(theme.style(VisualRole::Muted)),
+            Rect::new(
+                inner.x.saturating_add(left_width).saturating_add(1),
+                inner.y,
+                1,
+                body_height as u16,
+            ),
+        );
+    }
+    if show_right {
+        frame.render_widget(
+            Paragraph::new(right_visible),
+            Rect::new(right_x, inner.y, right_width, body_height as u16),
+        );
+    }
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(format!(" 编辑 {} ", form.provider.display_label()))
-                    .borders(Borders::ALL)
-                    .border_style(theme.focus_border),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(footer),
+        Rect::new(inner.x, divider_row, inner.width, footer_rows),
+    );
+    // The frame is painted last so neither pane's content can ever overwrite a
+    // border cell, whatever a row happens to contain.
+    frame.render_widget(
+        Block::default()
+            .title(format!(" 供应商管理 · {} ", editor_title(editor)))
+            .borders(Borders::ALL)
+            .border_style(theme.focus_border),
         popup,
     );
+
+    // The picker floats over the body only: anchoring it to the panel bottom
+    // would paint its frame across the action row the user needs to reach.
+    draw_editor_model_picker(frame, body_area, app, editor, theme);
+}
+
+/// `rect` grown by `margin` cells on every side, clamped to `bounds`.
+fn expand_within(rect: Rect, margin: u16, bounds: Rect) -> Rect {
+    let x = rect.x.saturating_sub(margin).max(bounds.x);
+    let y = rect.y.saturating_sub(margin).max(bounds.y);
+    let right = rect.right().saturating_add(margin).min(bounds.right());
+    let bottom = rect.bottom().saturating_add(margin).min(bounds.bottom());
+    Rect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
+/// The panel's title names the profile the *fields* are editing. It deliberately
+/// does not follow the cursor row: moving the selection does not load a draft
+/// until `Enter`, so a title bound to the selection would name one provider while
+/// the pane beside it still showed another.
+fn editor_title(editor: &ProviderEditor) -> String {
+    if editor.creating() {
+        return "新建自定义供应商".to_owned();
+    }
+    editor.form.provider.display_label().to_owned()
+}
+
+/// The pinned action row plus the key hints that fit beside it. Each action
+/// records its own rectangle as it is laid out, so the painted word and the
+/// clickable area are the same span.
+fn action_row(
+    editor: &mut ProviderEditor,
+    theme: &UiTheme,
+    row: u16,
+    inner: Rect,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut column = inner.x.saturating_add(2);
+    for (index, action) in [
+        EditorAction::Apply,
+        EditorAction::Delete,
+        EditorAction::Cancel,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            spans.push(Span::styled("  ", theme.style(VisualRole::Muted)));
+            column = column.saturating_add(2);
+        }
+        let label = format!(" {} ", action.label());
+        let width = UnicodeWidthStr::width(label.as_str()) as u16;
+        let enabled = action != EditorAction::Apply || editor.blocked_reason().is_none();
+        spans.push(Span::styled(
+            label,
+            if enabled {
+                theme.strong(VisualRole::Success)
+            } else {
+                theme.style(VisualRole::Muted)
+            },
+        ));
+        editor
+            .action_rects
+            .push((action, Rect::new(column, row, width, 1)));
+        column = column.saturating_add(width);
+    }
+    let hints = "Tab 切换窗格  ↑/↓ 选择  ←/→ 修改  Enter 打开  Ctrl+S 应用  Ctrl+R 刷新  Ctrl+G 取窗口  Ctrl+D 删除  Esc 返回";
+    let free = inner
+        .right()
+        .saturating_sub(column)
+        .saturating_sub(UnicodeWidthStr::width(hints) as u16 + 1) as usize;
+    if free > 0 {
+        spans.push(Span::styled(
+            format!("  {hints}"),
+            theme.style(VisualRole::Muted),
+        ));
+    }
+    spans
+}
+
+fn provider_row_lines(
+    editor: &ProviderEditor,
+    theme: &UiTheme,
+    label_columns: usize,
+) -> Vec<Vec<Span<'static>>> {
+    // ` marker label gap status` fills the pane exactly, so the status keeps its
+    // own column and the divider column stays put whichever status a row carries.
+    let mut lines = Vec::with_capacity(editor.rows.len() + 1);
+    for (index, row) in editor.rows.iter().enumerate() {
+        let selected = index == editor.selected_row && editor.pane == EditorPane::Providers;
+        let label = fit_text(&row.label, label_columns);
+        let pad = " ".repeat(label_columns.saturating_sub(UnicodeWidthStr::width(label.as_str())));
+        let badge = row.badge();
+        let status = if badge.is_empty() {
+            row.key_state().to_owned()
+        } else {
+            badge
+        };
+        let role = if row.active {
+            VisualRole::Accent
+        } else if row.connected {
+            VisualRole::Primary
+        } else {
+            VisualRole::Warning
+        };
+        lines.push(vec![
+            Span::styled(
+                format!(" {} {} ", if selected { "›" } else { " " }, label),
+                if selected {
+                    theme.selected
+                } else {
+                    theme.style(role)
+                },
+            ),
+            Span::styled(pad, theme.style(VisualRole::Muted)),
+            Span::styled(
+                status,
+                if selected {
+                    theme.selected
+                } else {
+                    theme.style(if row.connected {
+                        VisualRole::Success
+                    } else {
+                        VisualRole::Warning
+                    })
+                },
+            ),
+        ]);
+    }
+    // The create command is the last address, one past the last profile.
+    let selected = editor.on_add_row() && editor.pane == EditorPane::Providers;
+    lines.push(vec![Span::styled(
+        format!(" {} ＋ 添加自定义供应商", if selected { "›" } else { " " }),
+        if selected {
+            theme.selected
+        } else {
+            theme.strong(VisualRole::Success)
+        },
+    )]);
+    lines
+}
+
+/// The field pane, one entry per painted line. `Some(index)` marks the lines a
+/// click can focus; the context-window hint and the error line are informational
+/// and therefore address no field.
+fn editor_field_lines(
+    app: &App,
+    editor: &ProviderEditor,
+    theme: &UiTheme,
+    width: u16,
+) -> Vec<(Option<usize>, Vec<Span<'static>>)> {
+    let mut lines: Vec<(Option<usize>, Vec<Span<'static>>)> = Vec::new();
+    for (index, field) in EDITOR_FIELDS.iter().enumerate() {
+        let focused = index == editor.field_index && editor.pane == EditorPane::Fields;
+        let label = field.label();
+        let pad = " ".repeat(EDITOR_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(label)));
+        let value_style = if focused {
+            theme.selected
+        } else {
+            theme.style(VisualRole::Secondary)
+        };
+        let hint = theme.strong(VisualRole::Shortcut);
+        let mut spans = vec![Span::styled(
+            format!(" {} {label}{pad}  ", if focused { "›" } else { " " }),
+            if focused {
+                theme.selected
+            } else {
+                theme.style(VisualRole::Primary)
+            },
+        )];
+        match field {
+            EditorField::Name => {
+                let name = editor.form.provider.name.trim();
+                let (text, role) = if name.is_empty() && editor.creating() {
+                    ("必填：留空则无法创建".to_owned(), VisualRole::Warning)
+                } else if name.is_empty() {
+                    ("（内置/未命名）".to_owned(), VisualRole::Muted)
+                } else {
+                    (name.to_owned(), VisualRole::Secondary)
+                };
+                spans.push(Span::styled(
+                    text,
+                    if focused {
+                        theme.selected
+                    } else {
+                        theme.style(role)
+                    },
+                ));
+            }
+            EditorField::Template => {
+                spans.push(Span::styled(
+                    editor.form.provider.preset.label().to_owned(),
+                    value_style,
+                ));
+                spans.push(Span::styled(
+                    "（只读）".to_owned(),
+                    theme.style(VisualRole::Muted),
+                ));
+            }
+            EditorField::ContextWindow => {
+                spans.push(Span::styled(editor.window_value(app), value_style));
+                if focused && editor.window_fetch_available(app) {
+                    spans.push(Span::styled("  Ctrl+G 获取".to_owned(), hint));
+                }
+            }
+            EditorField::ApiKey => {
+                spans.push(Span::styled(
+                    editor.form.value(SettingsField::ApiKey).into_owned(),
+                    value_style,
+                ));
+                let (state, role) = if editor.form.has_existing_key() {
+                    ("已配置", VisualRole::Success)
+                } else {
+                    ("未配置", VisualRole::Warning)
+                };
+                spans.push(Span::styled(
+                    format!("  {state}"),
+                    if focused {
+                        theme.selected
+                    } else {
+                        theme.style(role)
+                    },
+                ));
+                spans.push(Span::styled(
+                    "（只写）".to_owned(),
+                    theme.style(VisualRole::Muted),
+                ));
+            }
+            _ => {
+                // The Model row shows the window the provider reported for the
+                // value, which the core form's plain field text does not carry.
+                let value = if *field == EditorField::Model {
+                    editor.model_value(app)
+                } else {
+                    let core = field.core().expect("core-owned field row");
+                    editor.form.value(core).into_owned()
+                };
+                spans.push(Span::styled(value, value_style));
+                if focused {
+                    match field {
+                        EditorField::Model => spans.push(Span::styled("  Enter".to_owned(), hint)),
+                        EditorField::Protocol | EditorField::Thinking => {
+                            spans.push(Span::styled("  ←/→".to_owned(), hint));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        lines.push((Some(index), spans));
+        if *field == EditorField::ContextWindow
+            && let Some(note) = editor.window_hint(app)
+        {
+            let role = if editor.window_fetch_pending {
+                VisualRole::Warning
+            } else {
+                VisualRole::Muted
+            };
+            for chunk in wrap_cells(&note, width.saturating_sub(5) as usize) {
+                lines.push((
+                    None,
+                    vec![Span::styled(format!("   {chunk}"), theme.style(role))],
+                ));
+            }
+        }
+    }
+    if let Some(error) = &editor.error {
+        for chunk in wrap_cells(error, width.saturating_sub(5) as usize) {
+            lines.push((
+                None,
+                vec![Span::styled(
+                    format!("   {chunk}"),
+                    theme.strong(VisualRole::Warning),
+                )],
+            ));
+        }
+    }
+    lines
+}
+
+/// The in-panel model picker, anchored to the model row's column and floating
+/// inside the panel. It is drawn last so it overlays the body it was opened
+/// from, and it records the geometry the next hit-test reads.
+fn draw_editor_model_picker(
+    frame: &mut Frame<'_>,
+    body: Rect,
+    app: &App,
+    editor: &mut ProviderEditor,
+    theme: &UiTheme,
+) {
+    if !editor.model_picker.open {
+        editor.model_picker.geometry = None;
+        return;
+    }
+    let model_field = EDITOR_FIELDS
+        .iter()
+        .position(|field| *field == EditorField::Model)
+        .unwrap_or(0);
+    let anchor = editor.field_rects[model_field];
+    let choices = editor.model_choices(app);
+    // Items plus the trailing "type it myself" row.
+    let items = choices.len() + 1;
+    let content = choices
+        .iter()
+        .map(|choice| {
+            UnicodeWidthStr::width(choice.label.as_str())
+                + choice
+                    .max_output
+                    .map(|out| grouped_tokens(out).len() + 7)
+                    .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(18)
+        .max(UnicodeWidthStr::width("（自定义模型名…）"))
+        .saturating_add(6) as u16;
+    let width = content.min(body.width).max(28);
+    let anchor_x = if anchor.height > 0 { anchor.x } else { body.x };
+    let geometry =
+        PickerGeometry::floating(body, anchor_x, width, items, editor.model_picker.selected);
+    editor.model_picker.geometry = Some(geometry);
+    editor.model_picker_rect = Some(geometry.area);
+
+    let rows = choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            let active = index == editor.model_picker.selected;
+            let mut text = format!("{} {}", if active { "›" } else { " " }, choice.label);
+            if active && let Some(out) = choice.max_output {
+                text.push_str(&format!("   {} out", grouped_tokens(out)));
+            }
+            (index, text, active)
+        })
+        .chain(std::iter::once((
+            choices.len(),
+            format!(
+                "{} （自定义模型名…）",
+                if editor.model_picker.selected == choices.len() {
+                    "›"
+                } else {
+                    " "
+                }
+            ),
+            editor.model_picker.selected == choices.len(),
+        )))
+        .collect::<Vec<_>>();
+    let items = rows
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            *index >= geometry.scroll && *index < geometry.scroll + geometry.visible
+        })
+        .map(|(_, (_, text, active))| {
+            ListItem::new(Line::from(Span::styled(
+                text,
+                if active {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Primary)
+                },
+            )))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, geometry.area);
+    frame.render_widget(
+        Block::default()
+            .title(" 选择模型 ↑↓ Enter Esc · Ctrl+R ")
+            .borders(Borders::ALL)
+            .border_style(theme.focus_border),
+        geometry.area,
+    );
+    let inner = geometry.inner();
+    frame.render_widget(
+        List::new(items),
+        Rect::new(inner.x, inner.y, inner.width, geometry.visible as u16),
+    );
+}
+
+/// First painted row of a window that keeps `selected` visible.
+fn window_start(selected: usize, len: usize, height: usize) -> usize {
+    if height == 0 || len <= height {
+        return 0;
+    }
+    selected
+        .saturating_sub(height.saturating_sub(1))
+        .min(len - height)
+}
+
+/// Breaks `text` into chunks of at most `width` cells on grapheme boundaries.
+/// Panel body rows are composed from both panes, so a wrapped hint has to become
+/// separate rows rather than let the paragraph reflow the alignment.
+fn wrap_cells(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let cell = UnicodeWidthStr::width(grapheme);
+        if used + cell > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push_str(grapheme);
+        used += cell;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Thousands separator, so a token budget reads as `8,192` rather than `8192`.
+fn grouped_tokens(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(character);
+    }
+    out
 }
 
 pub(super) fn draw_palette(

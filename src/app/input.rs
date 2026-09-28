@@ -2,8 +2,8 @@ use super::*;
 
 pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutcome> {
     if let Event::Paste(text) = &event {
-        if app.settings.is_some() {
-            return Ok(if paste_text_into_settings(app, text) {
+        if app.provider_editor.is_some() {
+            return Ok(if paste_into_editor(app, text) {
                 EventOutcome::redraw()
             } else {
                 EventOutcome::default()
@@ -17,7 +17,7 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
         return Ok(EventOutcome::default());
     }
     if let Event::Mouse(mouse) = event {
-        if let Some(outcome) = handle_settings_mouse(app, mouse)? {
+        if let Some(outcome) = handle_editor_mouse(app, mouse).await {
             return Ok(outcome);
         }
         if let Some(outcome) = handle_footer_mouse(app, mouse).await? {
@@ -28,7 +28,7 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
         }
         if output_mouse_event_allowed(
             mouse.kind,
-            app.settings.is_some(),
+            app.provider_editor.is_some(),
             app.palette.is_some(),
             app.has_pending_approval(),
         ) {
@@ -38,7 +38,7 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
     }
     if matches!(event, Event::Resize(_, _)) {
         if app.has_pending_approval()
-            || app.settings.is_some()
+            || app.provider_editor.is_some()
             || app.palette.is_some()
             || app.thinking_menu_open
             || app.provider_menu_open
@@ -86,16 +86,16 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
             osc52: None,
         });
     }
-    if app.settings.is_some() {
-        let redraw = settings_key_handled(key.code, key.modifiers);
-        handle_settings_key(app, key.code, key.modifiers).await;
+    if app.provider_editor.is_some() {
+        let redraw = editor_key_handled(key.code, key.modifiers);
+        handle_editor_key(app, key.code, key.modifiers).await;
         return Ok(EventOutcome {
             redraw,
             osc52: None,
         });
     }
     if app.provider_menu_open || app.model_menu_open || app.thinking_menu_open {
-        return handle_footer_menu_key(app, key.code).await;
+        return handle_footer_menu_key(app, key.code, key.modifiers).await;
     }
     if app.palette.is_some() {
         let redraw = palette_key_handled(key.code, key.modifiers);
@@ -289,46 +289,4 @@ pub(super) async fn handle_terminal_event(app: &mut App, event: Event) -> Result
         redraw,
         osc52: None,
     })
-}
-
-fn handle_settings_mouse(
-    app: &mut App,
-    mouse: crossterm::event::MouseEvent,
-) -> Result<Option<EventOutcome>> {
-    let Some(settings) = app.settings.as_mut() else {
-        return Ok(None);
-    };
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return Ok(Some(EventOutcome::default()));
-    }
-    let Some(rect) = app.settings_rect else {
-        return Ok(Some(EventOutcome::default()));
-    };
-    let inner = ratatui::widgets::Block::bordered().inner(rect);
-    if !point_in_rect(mouse.column, mouse.row, inner) {
-        return Ok(Some(EventOutcome::default()));
-    }
-    let relative_row = mouse.row.saturating_sub(inner.y) as usize;
-    match settings {
-        SettingsState::List(list) => {
-            let profile_start = 2usize;
-            if relative_row >= profile_start && relative_row < profile_start + list.providers.len()
-            {
-                list.selected = relative_row - profile_start;
-                open_selected_profile(app);
-            } else if relative_row == profile_start + list.providers.len() + 1 {
-                list.selected = list.providers.len();
-                open_template_picker(app);
-            }
-        }
-        SettingsState::Templates(templates) => {
-            let start = 2usize;
-            if relative_row >= start && relative_row < start + templates.presets.len() {
-                templates.selected = relative_row - start;
-                open_selected_template(app);
-            }
-        }
-        SettingsState::Form(_) => {}
-    }
-    Ok(Some(EventOutcome::redraw()))
 }

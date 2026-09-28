@@ -90,23 +90,25 @@ TUI 落后 core 的关键提交包括：
 
 **验收**：TUI 能用新 core 编译并通过 conformance 相关测试；无 path patch。
 
-### Phase 2：接入 Provider 设置权威视图
+### Phase 2：接入 Provider 设置权威视图 —— 已完成
 
-- [ ] 在 TUI facade 增加 Provider 设置状态，来源改为 `AppHandle::provider_settings()`：
+> 实施细节与验收记录见 [TUI 供应商界面制作计划](tui-provider-settings-plan.md)。以下条目按实现状态勾选。
+
+- [x] 在 TUI facade 增加 Provider 设置状态，来源改为 `AppHandle::provider_settings()`：
   - `active`：当前 profile。
   - `saved`：已保存 profile。
   - `connected`：core 当前可解析 API Key 的 preset。
-- [ ] `provider_choices()` 改为：
+- [x] `provider_choices()` 改为：
   - 以 core registry 顺序为基础；
   - 合并 `connected` 与 `saved`；
   - 保留 active preset；
-  - 不再依赖 `app.config.providers` 作为显示权威。
-- [ ] Provider 列表显示连接状态：
+  - 不再依赖 `app.config.providers` 作为显示权威（仅作为 core 视图到达前的兜底）。
+- [x] Provider 列表显示连接状态：
   - 已连接：正常可选；
-  - 未连接：仍可进入编辑，但明确提示需要 API Key；
+  - 未连接：仍可进入编辑，但明确提示需要 API Key（页脚 pill 与面板左栏同源）；
   - `connected` 缺失只表示当前未解析到 key，不判定“从未配置”。
-- [ ] 打开设置时先读 cache，不强制网络刷新。
-- [ ] 移除或降级 `Config::load` 在 Provider 设置中的职责；config 仍可用于 UI 偏好、启动参数与高级 TUI 设置。
+- [x] 打开设置时先读 cache，不强制网络刷新。
+- [x] 移除或降级 `Config::load` 在 Provider 设置中的职责；config 仍可用于 UI 偏好、启动参数与高级 TUI 设置。
 
 **验收**：
 
@@ -114,9 +116,9 @@ TUI 落后 core 的关键提交包括：
 - TUI 不再自行推导连接状态。
 - 无 API Key 泄漏到渲染或日志。
 
-### Phase 3：接入动态模型列表与元数据
+### Phase 3：接入动态模型列表与元数据 —— 已完成
 
-- [ ] 新增 TUI 侧 `ProviderModelsState`：
+- [x] 新增 TUI 侧 `ProviderModelsState`：
   - `models: Vec<ProviderModelDto>`
   - `fetched_at: Option<i64>`
   - `loading: bool`
@@ -147,31 +149,31 @@ TUI 落后 core 的关键提交包括：
 - 刷新期间终端仍可取消/审批/输入。
 - 当前模型即使不在列表中也始终可选。
 
-### Phase 4：Provider 编辑语义对齐
+### Phase 4：Provider 编辑语义对齐 —— 已完成
 
-- [ ] 基础 Provider 编辑改走：
+- [x] 基础 Provider 编辑改走：
   `AppHandle::set_provider_profile(preset, model, base_url, kind, context_window_tokens)`。
-- [ ] TUI 设置表单补齐字段：
+- [x] TUI 设置表单补齐字段：
   - Provider preset：只读身份，不通过切换字段绕过一个 preset 一个 profile 的规则；
   - Model；
   - Base URL；
   - Protocol：Responses / Chat Completions；
   - Context window override：空值表示继承合并 profile，填数字表示显式覆盖；
   - API Key：write-only。
-- [ ] API Key 写入顺序修正为：
+- [x] API Key 写入顺序修正为：
   1. 若输入非空，先 `secrets::store_api_key_cached(preset, key)`；
   2. keyring 写失败时保留本次运行有效 key，并显示降级警告；
   3. 再调用 `set_provider_profile`。
-- [ ] 应用成功后：
+- [x] 应用成功后：
   - 刷新 snapshot；
   - 重新读取 `provider_settings()`；
   - 重新读取 `provider_models(false)`；
   - 等待 `context_updated` 更新上下文容量。
-- [ ] 移除 TUI 手动 `app.config.upsert_provider()` 与 `app.config.save()` 双写；core 的 `set_provider_profile`/`set_provider_config` 已负责持久化。
-- [ ] 保留 TUI 高级能力：
+- [x] 移除 TUI 手动 `app.config.upsert_provider()` 与 `app.config.save()` 双写；core 的 `set_provider_profile`/`set_provider_config` 已负责持久化。
+- [x] 保留 TUI 高级能力：
   - Thinking level/budget 仍可通过现有 thinking 菜单编辑；
   - 如需完整 `ProviderConfig` 提交，仅用于 TUI 高级设置，并从刷新后的 config/snapshot 重新种子化，避免用 stale profile 覆盖 core。
-- [ ] `remove_provider` 后改从 `provider_settings()` 收敛列表，不再依赖本地 config reload 作为权威。
+- [x] `remove_provider` 后改从 `provider_settings()` 收敛列表，不再依赖本地 config reload 作为权威。
 
 **验收**：
 
@@ -300,22 +302,22 @@ TUI 落后 core 的关键提交包括：
 | core 依赖升级后事件回放 | `cargo test --lib --all-features --locked conformance` |
 | Provider 设置状态 | `app::tests::provider` |
 | 动态模型列表 | `app::tests::model` / `provider_models` |
-| Provider apply | `app::tests::settings` / `set_provider_profile` |
+| Provider apply | `app::tests::provider_panel` / `set_provider_profile` |
 | 上下文计量 | `projection::tests::context` / `usage` |
 | 工具显示 | `ui::tests::tool` / `projection::tests::tool` |
 | 会话与命令 | `app::tests::command` / `session` |
 
 ### 5.2 必测行为
 
-- [ ] `provider_settings()` 返回的 active/saved/connected 正确进入 TUI 状态。
-- [ ] 动态模型列表与静态 fallback 合并且去重。
-- [ ] `provider_models(true)` 失败时保留旧列表。
-- [ ] 模型刷新不阻塞取消/审批。
-- [ ] API Key 先写 keyring/cache，再应用 profile。
-- [ ] keyring 写失败时本次运行仍可用并提示降级。
-- [ ] `set_provider_profile` 后 config 只持久化一次。
-- [ ] context window 空值继承合并 profile。
-- [ ] context window 数字值由 core clamp。
+- [x] `provider_settings()` 返回的 active/saved/connected 正确进入 TUI 状态。
+- [x] 动态模型列表与静态 fallback 合并且去重。
+- [x] `provider_models(true)` 失败时保留旧列表。
+- [x] 模型刷新不阻塞取消/审批。
+- [x] API Key 先写 keyring/cache，再应用 profile。
+- [x] keyring 写失败时本次运行仍可用并提示降级。
+- [x] `set_provider_profile` 后 config 只持久化一次。
+- [x] context window 空值继承合并 profile。
+- [x] context window 数字值由 core clamp。
 - [ ] `Usage` 不再改写上下文用量。
 - [ ] `ContextUpdated` 重置 overlay。
 - [ ] `ResyncRequired` 后重建 projection。
@@ -340,13 +342,15 @@ git diff --check
 
 ```text
 Phase 1 core 依赖升级
-  └─ Phase 2 provider_settings 权威视图
-      └─ Phase 3 provider_models 动态列表
-          └─ Phase 4 set_provider_profile 编辑语义
+  └─ Phase 2 provider_settings 权威视图            —— 已完成
+      └─ Phase 3 provider_models 动态列表          —— 已完成
+          └─ Phase 4 set_provider_profile 编辑语义 —— 已完成
               └─ Phase 5 context/usage 修正
                   └─ Phase 6 新工具显示
                       └─ Phase 7 parity 审计与完整验证
 ```
+
+Phase 2–4 的界面落地与验收记录见 [TUI 供应商界面制作计划](tui-provider-settings-plan.md)（含面板键位、单栏布局与"画出的行才可点"契约）。
 
 不建议并行调整 Phase 4 与 Phase 5：Provider profile 会影响 context window，而 context 修正依赖新 core 的 `ContextUpdated` 语义。Phase 6 可与 Phase 5 并行，但应在 Phase 1 完成后进行。
 

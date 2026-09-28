@@ -583,6 +583,752 @@ fn listed_models(count: usize) -> ProviderModelsState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The provider panel: one pass paints the rows, and the same pass records the
+// rectangles those rows answer to.
+// ---------------------------------------------------------------------------
+
+/// Opens the panel after saving one profile **through the core**, so `saved`
+/// and the active view come from the authority rather than a hand-faked DTO,
+/// and paints it once so the caller can click the cells the frame really drew.
+async fn painted_panel(width: u16) -> (App, Terminal<TestBackend>, tempfile::TempDir) {
+    let (mut app, temp) = test_app().await;
+    app.handle
+        .set_provider_profile(
+            "openai",
+            ProviderPreset::OpenAi,
+            None,
+            "openai-model",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("save an openai profile");
+    // The key state depends on the host's keyring and environment, so it is
+    // pinned here: a panel test must not flip with the machine it runs on.
+    let backend = TestBackend::new(width, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    super::provider_editor::open_settings(&mut app).await;
+    app.provider_models = listed_models(6);
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    (app, terminal, temp)
+}
+
+async fn send(app: &mut App, event: Event) {
+    handle_terminal_event(app, event).await.expect("event");
+}
+
+use super::provider_editor::ProviderRow;
+
+/// Reaches into the panel's own state, which is exactly what the draw pass
+/// does: the tests below arm a background answer without going to the network.
+fn with_editor<R>(app: &mut App, body: impl FnOnce(&mut ProviderEditor) -> R) -> Option<R> {
+    super::provider_editor::with_editor(app, |_, editor| body(editor))
+}
+
+/// Reads one painted row the way the terminal lays it out: a wide symbol owns
+/// the cell that follows it. `TestBackend` leaves that follower cell holding
+/// whatever the previous frame put there, so a column-by-column read interleaves
+/// stale characters into every CJK row.
+fn panel_cells(
+    buffer: &ratatui::buffer::Buffer,
+    rect: ratatui::layout::Rect,
+    row: u16,
+) -> Vec<(u16, &str)> {
+    let mut cells = Vec::new();
+    let mut column = rect.x;
+    while column < rect.x + rect.width {
+        let symbol = buffer[(column, row)].symbol();
+        cells.push((column, symbol));
+        column += UnicodeWidthStr::width(symbol).max(1) as u16;
+    }
+    cells
+}
+
+#[tokio::test]
+async fn provider_panel_opens_on_the_active_provider_with_its_draft_loaded() {
+    let (app, _terminal, _temp) = painted_panel(120).await;
+    let editor = app.provider_editor.as_ref().expect("panel open");
+    assert_eq!(editor.pane, EditorPane::Providers);
+    assert_eq!(
+        editor.selected_provider().map(|row| row.id.as_str()),
+        Some("openai"),
+        "the panel opens on the provider that is actually active"
+    );
+    assert_eq!(editor.field(), EditorField::Name);
+    // The draft is the core's own profile, not a stale copy of the local config.
+    assert_eq!(editor.form.provider.model, "openai-model");
+    assert_eq!(
+        editor.rows.len(),
+        4,
+        "the four built-in families are listed even when unsaved"
+    );
+    assert_eq!(
+        editor.row_rects.len(),
+        editor.rows.len() + 1,
+        "the create command is one more address than the profiles"
+    );
+    assert!(
+        editor
+            .row_rects
+            .iter()
+            .chain(editor.field_rects.iter())
+            .all(|rect| rect.width > 0 && rect.height == 1),
+        "every painted row answers a click"
+    );
+    assert_eq!(editor.field_rects.len(), EDITOR_FIELDS.len());
+    assert_eq!(
+        editor.action_rects.len(),
+        3,
+        "apply, delete and cancel each own a rectangle"
+    );
+    assert!(!editor.delete_confirm, "deleting never starts armed");
+}
+
+#[tokio::test]
+async fn provider_panel_rows_and_fields_answer_the_cells_they_paint() {
+    let (mut app, mut terminal, _temp) = painted_panel(120).await;
+    let rows = app
+        .provider_editor
+        .as_ref()
+        .expect("panel open")
+        .row_rects
+        .clone();
+    // Each painted profile row loads the draft it names.
+    for (index, rect) in rows.iter().enumerate().take(4) {
+        send(&mut app, picker_click(rect.x + 2, rect.y)).await;
+        let editor = app.provider_editor.as_ref().expect("panel open");
+        assert_eq!(
+            editor.selected_row, index,
+            "row {index} resolves its own cell"
+        );
+        assert_eq!(editor.pane, EditorPane::Fields);
+        terminal
+            .draw(|frame| ui::draw(frame, &mut app))
+            .expect("draw");
+    }
+    // The trailing address starts a create draft instead of selecting a profile.
+    let add = rows[4];
+    send(&mut app, picker_click(add.x + 2, add.y)).await;
+    let editor = app.provider_editor.as_ref().expect("panel open");
+    assert!(editor.creating(), "an empty id is the create address");
+    assert!(editor.form.provider.name.trim().is_empty());
+    assert_eq!(editor.form.provider.preset, ProviderPreset::Custom);
+    assert_eq!(
+        editor.field(),
+        EditorField::Name,
+        "a create starts on the required field"
+    );
+
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let fields = app
+        .provider_editor
+        .as_ref()
+        .expect("panel open")
+        .field_rects
+        .clone();
+    for (index, rect) in fields.iter().enumerate() {
+        send(&mut app, picker_click(rect.x + 1, rect.y)).await;
+        assert_eq!(
+            app.provider_editor
+                .as_ref()
+                .expect("panel open")
+                .field_index,
+            index,
+            "field row {index} resolves its own cell"
+        );
+    }
+
+    // A click on the panel frame itself is swallowed rather than leaking to the
+    // control the panel covers.
+    let popup = app.provider_editor.as_ref().expect("panel open").rect;
+    send(&mut app, picker_click(popup.x, popup.y)).await;
+    assert!(
+        app.provider_editor.is_some(),
+        "the frame is part of the panel"
+    );
+}
+
+#[tokio::test]
+async fn provider_panel_escape_steps_back_from_fields_to_rows_to_closed() {
+    let (mut app, _terminal, _temp) = painted_panel(120).await;
+    send(&mut app, picker_key(KeyCode::Tab)).await;
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").pane,
+        EditorPane::Fields
+    );
+    send(&mut app, picker_key(KeyCode::Up)).await;
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").field_index,
+        EDITOR_FIELDS.len() - 1,
+        "the field cursor wraps"
+    );
+    send(&mut app, picker_key(KeyCode::Down)).await;
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").field_index,
+        0,
+        "and wraps forward again"
+    );
+    // Esc walks back one level at a time: fields, then the panel itself.
+    send(&mut app, picker_key(KeyCode::Esc)).await;
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").pane,
+        EditorPane::Providers,
+        "leaving the fields keeps the draft"
+    );
+    send(&mut app, picker_key(KeyCode::Esc)).await;
+    assert!(
+        app.provider_editor.is_none(),
+        "the second Esc closes the panel"
+    );
+}
+
+#[tokio::test]
+async fn provider_panel_refuses_an_incomplete_draft_before_touching_the_core() {
+    let (mut app, _terminal, _temp) = painted_panel(120).await;
+    // Walk to the create command and enter it.
+    for _ in 0..4 {
+        send(&mut app, picker_key(KeyCode::Down)).await;
+    }
+    send(&mut app, picker_key(KeyCode::Enter)).await;
+    assert!(app.provider_editor.as_ref().expect("panel").creating());
+
+    send(
+        &mut app,
+        picker_key_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    )
+    .await;
+    let editor = app.provider_editor.as_ref().expect("panel stays open");
+    assert_eq!(
+        editor.error.as_deref(),
+        Some("自定义供应商名称不能为空"),
+        "the reason is reported inside the panel, not behind it"
+    );
+    assert!(
+        editor.blocked_reason().is_some(),
+        "and the same reason is what disables apply"
+    );
+
+    // A name is not enough: a provider without a model cannot be applied.
+    for character in "MyProvider".chars() {
+        send(&mut app, picker_key(KeyCode::Char(character))).await;
+    }
+    send(
+        &mut app,
+        picker_key_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    )
+    .await;
+    assert_eq!(
+        app.provider_editor
+            .as_ref()
+            .expect("panel")
+            .error
+            .as_deref(),
+        Some("模型不能为空")
+    );
+
+    // With both, the apply reaches the core, which mints the id.
+    for _ in 0..3 {
+        send(&mut app, picker_key(KeyCode::Down)).await;
+    }
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").field(),
+        EditorField::Model
+    );
+    for character in "test-model".chars() {
+        send(&mut app, picker_key(KeyCode::Char(character))).await;
+    }
+    send(
+        &mut app,
+        picker_key_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    )
+    .await;
+    let editor = app.provider_editor.as_ref().expect("the panel stays open");
+    assert_eq!(editor.error, None, "a complete draft applies");
+    assert!(
+        editor
+            .selected_provider()
+            .is_some_and(|row| row.id.starts_with("custom-")),
+        "the core minted a fresh custom id and the panel reselected it: {:?}",
+        editor.selected_provider().map(|row| row.id.clone())
+    );
+    assert!(
+        app.current.status.starts_with("已保存"),
+        "status: {}",
+        app.current.status
+    );
+    assert!(
+        app.provider_settings
+            .as_ref()
+            .expect("settings")
+            .saved
+            .iter()
+            .any(|profile| profile.name == "MyProvider"),
+        "the new profile is visible in the core's own view: {:?}",
+        app.provider_settings
+            .as_ref()
+            .expect("settings")
+            .saved
+            .iter()
+            .map(|profile| (&profile.id, &profile.preset, &profile.name))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn provider_panel_arms_deletion_and_only_deletes_on_confirmation() {
+    let (mut app, _terminal, _temp) = painted_panel(120).await;
+    // An unsaved built-in template has nothing to remove.
+    send(&mut app, picker_key(KeyCode::Down)).await;
+    send(
+        &mut app,
+        picker_key_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    )
+    .await;
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert!(!editor.delete_confirm, "there is nothing to confirm");
+    assert_eq!(editor.error.as_deref(), Some("内置模板尚未保存，无需删除"));
+
+    // The saved active profile does arm the confirmation — and stays armed.
+    send(&mut app, picker_key(KeyCode::Up)).await;
+    send(
+        &mut app,
+        picker_key_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    )
+    .await;
+    assert!(app.provider_editor.as_ref().expect("panel").delete_confirm);
+    send(&mut app, picker_key(KeyCode::Char('n'))).await;
+    assert!(
+        !app.provider_editor.as_ref().expect("panel").delete_confirm,
+        "n cancels without deleting"
+    );
+    assert!(
+        app.provider_settings
+            .as_ref()
+            .expect("settings")
+            .saved
+            .iter()
+            .any(|profile| profile.id == "openai"),
+        "nothing was removed"
+    );
+    // While the confirmation is armed, only its own answers act: a stray
+    // keystroke must not be read as "yes".
+    send(
+        &mut app,
+        picker_key_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    )
+    .await;
+    assert!(app.provider_editor.as_ref().expect("panel").delete_confirm);
+    send(&mut app, picker_key(KeyCode::Char('x'))).await;
+    assert!(
+        app.provider_editor.as_ref().expect("panel").delete_confirm,
+        "an unrelated key leaves the question open"
+    );
+    assert!(
+        app.provider_settings
+            .as_ref()
+            .expect("settings")
+            .saved
+            .iter()
+            .any(|profile| profile.id == "openai"),
+        "and still removes nothing"
+    );
+}
+
+#[tokio::test]
+async fn provider_panel_model_picker_fills_the_draft_without_applying_it() {
+    let (mut app, mut terminal, _temp) = painted_panel(120).await;
+    send(&mut app, picker_key(KeyCode::Tab)).await;
+    for _ in 0..3 {
+        send(&mut app, picker_key(KeyCode::Down)).await;
+    }
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").field(),
+        EditorField::Model
+    );
+    let before = app
+        .provider_editor
+        .as_ref()
+        .expect("panel")
+        .form
+        .provider
+        .model
+        .clone();
+    send(&mut app, picker_key(KeyCode::Enter)).await;
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert!(editor.model_picker.open);
+    assert!(editor.model_picker_rect.is_some(), "the picker was painted");
+    let choices = editor.model_choices(&app);
+    assert!(choices.len() >= 2, "the picker offers more than one row");
+    assert_eq!(
+        editor.model_picker.selected,
+        choices
+            .iter()
+            .position(|choice| choice.id == before)
+            .expect("the draft's own model is one of the offers"),
+        "the draft's own model is highlighted first"
+    );
+    let selected = editor.model_picker.selected;
+
+    // Esc abandons the picker without touching the draft.
+    send(&mut app, picker_key(KeyCode::Esc)).await;
+    assert!(
+        !app.provider_editor
+            .as_ref()
+            .expect("panel")
+            .model_picker
+            .open
+    );
+    assert_eq!(
+        app.provider_editor
+            .as_ref()
+            .expect("panel")
+            .form
+            .provider
+            .model,
+        before
+    );
+
+    // Down then Enter takes exactly the row after the highlighted one — or, on
+    // the trailing "type it myself" row, keeps the value and only returns focus.
+    let next = selected + 1;
+    let expected = if next < choices.len() {
+        choices[next].id.clone()
+    } else {
+        before.clone()
+    };
+    send(&mut app, picker_key(KeyCode::Enter)).await;
+    send(&mut app, picker_key(KeyCode::Down)).await;
+    send(&mut app, picker_key(KeyCode::Enter)).await;
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert!(!editor.model_picker.open, "choosing closes the picker");
+    assert_eq!(editor.form.provider.model, expected);
+    assert_eq!(
+        app.provider_settings
+            .as_ref()
+            .expect("settings")
+            .active
+            .model,
+        "openai-model",
+        "the draft is not the profile until it is applied"
+    );
+}
+
+#[tokio::test]
+async fn provider_panel_keeps_the_stacked_pane_clickable_on_a_narrow_terminal() {
+    let (mut app, mut terminal, _temp) = painted_panel(68).await;
+    send(&mut app, picker_key(KeyCode::Tab)).await;
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert_eq!(editor.pane, EditorPane::Fields);
+    assert!(
+        editor
+            .field_rects
+            .iter()
+            .all(|rect| rect.width > 0 && rect.right() <= editor.rect.right()),
+        "the stacked pane keeps a real width instead of a zero-width hit box"
+    );
+    let model = editor.field_rects[EDITOR_FIELDS
+        .iter()
+        .position(|field| *field == EditorField::Model)
+        .expect("model row")];
+    send(&mut app, picker_click(model.x + 1, model.y)).await;
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").field(),
+        EditorField::Model
+    );
+}
+
+#[tokio::test]
+async fn provider_panel_window_fetch_fills_the_buffer_from_the_reported_models() {
+    let (mut app, _terminal, _temp) = painted_panel(120).await;
+    send(&mut app, picker_key(KeyCode::Tab)).await;
+    for _ in 0..5 {
+        send(&mut app, picker_key(KeyCode::Down)).await;
+    }
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").field(),
+        EditorField::ContextWindow
+    );
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert!(
+        editor.window_fetch_available(&app),
+        "the draft is the active profile, so its endpoint is the one to ask"
+    );
+    assert!(
+        editor.window_hint(&app).is_some(),
+        "an unresolved window explains the override range"
+    );
+
+    // Arm the fetch the way its accelerator does, then land the answer the way the
+    // event loop does — no network, and no dependence on the host's keyring. The
+    // accelerator's own routing is covered by the not-active test below, which
+    // reaches the same handler without starting a background task.
+    let armed = with_editor(&mut app, |editor| {
+        editor.window_fetch_pending = true;
+        editor.window_fetch_pending
+    });
+    assert_eq!(armed, Some(true));
+
+    let generation = app.model_refresh_generation;
+    let provider_id = app.active_provider_id();
+    let model = app
+        .provider_editor
+        .as_ref()
+        .expect("panel")
+        .form
+        .provider
+        .model
+        .clone();
+    let report = |models: Vec<ProviderModelDto>| ModelRefreshResult {
+        generation,
+        provider_id: provider_id.clone(),
+        result: Ok(ProviderModelsDto {
+            models,
+            fetched_at: None,
+        }),
+    };
+    apply_model_refresh_result(
+        &mut app,
+        report(vec![ProviderModelDto {
+            id: model.clone(),
+            context_window_tokens: Some(200_000),
+            max_output_tokens: Some(8_192),
+        }]),
+    );
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert_eq!(
+        editor.window_input, "200000",
+        "the reported window becomes the explicit value"
+    );
+    assert_eq!(
+        editor.window_note.as_deref(),
+        Some("已获取；保留则作为显式值优先生效，清空则交给自动解析。")
+    );
+    assert_eq!(
+        editor.window_value(&app),
+        "200000",
+        "the buffer wins while set"
+    );
+
+    // A report that carries no window for the model says so instead of guessing.
+    let _ = with_editor(&mut app, |editor| editor.window_fetch_pending = true);
+    apply_model_refresh_result(
+        &mut app,
+        report(vec![ProviderModelDto {
+            id: model.clone(),
+            context_window_tokens: None,
+            max_output_tokens: None,
+        }]),
+    );
+    assert_eq!(
+        app.provider_editor
+            .as_ref()
+            .expect("panel")
+            .window_note
+            .as_deref(),
+        Some("接口与内置注册表均未报告该模型窗口，请手填。")
+    );
+
+    // A failed refresh is reported as a failure, not as "unknown".
+    let _ = with_editor(&mut app, |editor| editor.window_fetch_pending = true);
+    apply_model_refresh_result(
+        &mut app,
+        ModelRefreshResult {
+            generation,
+            provider_id,
+            result: Err("gateway unreachable".to_owned()),
+        },
+    );
+    assert_eq!(
+        app.provider_editor
+            .as_ref()
+            .expect("panel")
+            .window_note
+            .as_deref(),
+        Some("刷新失败：网关不可达或密钥未配置。")
+    );
+}
+
+/// Every painted body row must put the pane divider in the same column, no
+/// matter which status that row carries or how long its name is. The panes were
+/// once composed into a single line and kept aligned only by padding the left
+/// pane to a fixed width, so a status one cell wider than the reservation
+/// (`当前 已配置 ●` is 13 cells, `需要 API Key` is 12) pushed that row's divider
+/// sideways and every row looked misaligned against it.
+#[tokio::test]
+async fn provider_panel_paints_one_divider_column_for_every_row_shape() {
+    let (mut app, mut terminal, _temp) = painted_panel(120).await;
+    let rows = vec![
+        ProviderRow {
+            id: "openai".to_owned(),
+            preset: ProviderPreset::OpenAi,
+            label: "OpenAI".to_owned(),
+            saved: true,
+            active: true,
+            connected: true,
+        },
+        ProviderRow {
+            id: "custom-1".to_owned(),
+            preset: ProviderPreset::Custom,
+            label: "某公司内部网关供应商一号".to_owned(),
+            saved: true,
+            active: false,
+            connected: true,
+        },
+        ProviderRow {
+            id: "deepseek".to_owned(),
+            preset: ProviderPreset::DeepSeek,
+            label: "DeepSeek".to_owned(),
+            saved: false,
+            active: false,
+            connected: false,
+        },
+        ProviderRow {
+            id: "custom-2".to_owned(),
+            preset: ProviderPreset::Custom,
+            label: "a-very-long-ascii-provider-name-without-any-spaces".to_owned(),
+            saved: true,
+            active: false,
+            connected: false,
+        },
+    ];
+    let armed = with_editor(&mut app, |editor| {
+        editor.rows = rows;
+        editor.selected_row = 0;
+        editor.pane = EditorPane::Fields;
+        editor.field_index = 4;
+        editor.form.provider.base_url =
+            "https://gateway.internal.example.com/openai-compatible/v1".to_owned();
+    });
+    assert!(armed.is_some(), "the panel is open");
+
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let rect = app.provider_editor.as_ref().expect("panel").rect;
+    // The body is what sits above the separator and the action row: those two
+    // footer rows carry the frame's side borders but no pane divider.
+    let body_rows = rect.height - 4;
+    let dividers: Vec<Vec<u16>> = {
+        let buffer = terminal.backend().buffer();
+        (rect.y + 1..rect.y + 1 + body_rows)
+            .map(|row| {
+                panel_cells(buffer, rect, row)
+                    .into_iter()
+                    .filter(|(_, symbol)| *symbol == "│")
+                    .map(|(column, _)| column)
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(
+        dividers.len() as u16,
+        body_rows,
+        "the body painted every row"
+    );
+    for columns in &dividers {
+        assert_eq!(
+            columns.len(),
+            3,
+            "each body row shows the frame and one divider: {columns:?}"
+        );
+        assert_eq!(
+            columns, &dividers[0],
+            "every body row shares one divider column"
+        );
+    }
+}
+
+/// The provider name is the row's identity, so a name wider than the label
+/// column is truncated rather than allowed to eat the status column: the status
+/// is what tells the user the row has no key yet.
+#[tokio::test]
+async fn provider_panel_truncates_a_long_name_before_the_status() {
+    let (mut app, mut terminal, _temp) = painted_panel(120).await;
+    let long_name = "某公司内部网关供应商一号与灾备网关二号以及测试网关三号";
+    let armed = with_editor(&mut app, |editor| {
+        editor.rows = vec![ProviderRow {
+            id: "custom-1".to_owned(),
+            preset: ProviderPreset::Custom,
+            label: long_name.to_owned(),
+            saved: true,
+            active: false,
+            connected: false,
+        }];
+        editor.selected_row = 0;
+    });
+    assert!(armed.is_some(), "the panel is open");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let rect = app.provider_editor.as_ref().expect("panel").rect;
+    let row = rect.y + 1;
+    let text: String = {
+        let buffer = terminal.backend().buffer();
+        panel_cells(buffer, rect, row)
+            .into_iter()
+            .map(|(_, symbol)| symbol)
+            .collect()
+    };
+    assert!(
+        UnicodeWidthStr::width(long_name) > 40,
+        "the name is wider than the pane's label column: {text:?}"
+    );
+    assert!(
+        !text.contains(long_name),
+        "the whole name cannot fit: {text:?}"
+    );
+    assert!(text.contains("..."), "the long name is truncated: {text:?}");
+    assert!(
+        text.contains("已配置"),
+        "and the status survives the truncation: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn provider_panel_refuses_to_fetch_a_window_for_a_draft_that_is_not_active() {
+    let (mut app, _terminal, _temp) = painted_panel(120).await;
+    // DeepSeek is not the active provider, so its base URL is not the one the
+    // core would query on the panel's behalf.
+    send(&mut app, picker_key(KeyCode::Down)).await;
+    send(&mut app, picker_key(KeyCode::Enter)).await;
+    for _ in 0..5 {
+        send(&mut app, picker_key(KeyCode::Down)).await;
+    }
+    assert_eq!(
+        app.provider_editor.as_ref().expect("panel").field(),
+        EditorField::ContextWindow
+    );
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert!(
+        !editor.window_fetch_available(&app),
+        "a draft that is not the active profile has no endpoint to ask"
+    );
+    send(
+        &mut app,
+        picker_key_with(KeyCode::Char('g'), KeyModifiers::CONTROL),
+    )
+    .await;
+    let editor = app.provider_editor.as_ref().expect("panel");
+    assert_eq!(
+        editor.window_note.as_deref(),
+        Some("只能获取当前生效供应商的模型窗口")
+    );
+    assert!(!editor.window_fetch_pending, "and nothing was requested");
+}
+
 #[tokio::test]
 async fn thinking_picker_is_operable_from_the_keyboard() {
     let (mut app, _temp) = test_app().await;
@@ -795,7 +1541,9 @@ async fn provider_picker_rows_map_to_the_rendered_provider() {
         app.provider_menu_selected, 0,
         "the cursor starts on the active provider, not on a stale index"
     );
-    for row in inner.y..inner.bottom() {
+    // Only the item window resolves providers: the pinned action row below it
+    // is a separate control and must never be mistaken for a provider.
+    for row in inner.y..inner.y.saturating_add(picker.visible as u16) {
         let text = picker_row(&terminal, row, inner.x, inner.right());
         let choice = crate::app::provider::provider_menu_selection(&app, picker, inner.x + 2, row)
             .unwrap_or_else(|| panic!("row {row} paints {text:?} but resolves no provider"));
@@ -805,6 +1553,22 @@ async fn provider_picker_rows_map_to_the_rendered_provider() {
             choice.label
         );
     }
+    let action = picker.action.expect("the picker pins a settings entry");
+    assert!(
+        inner.y.saturating_add(picker.visible as u16) == action.y
+            && action.bottom() == inner.bottom(),
+        "the pinned entry owns the last inner row: {action:?} in {inner:?}"
+    );
+    let action_text = picker_row(&terminal, action.y, inner.x, inner.right());
+    assert!(
+        action_text.contains("供应商设置") && action_text.contains("Ctrl+S"),
+        "the pinned row advertises the settings entry: {action_text:?}"
+    );
+    assert_eq!(
+        crate::app::provider::provider_menu_selection(&app, picker, action.x + 1, action.y),
+        None,
+        "the pinned row must not resolve a provider"
+    );
 
     // Keyboard: Down moves the visible cursor, Esc dismisses without applying.
     handle_terminal_event(&mut app, picker_key(KeyCode::Down))
@@ -937,5 +1701,231 @@ async fn provider_picker_enter_clamps_a_stale_cursor() {
         app.current.status.contains("DeepSeek"),
         "the highlighted row is what was requested: {}",
         app.current.status
+    );
+    assert!(
+        app.provider_editor.is_some(),
+        "a provider without a key is redirected into the panel instead of switched"
+    );
+    let editor_row = app
+        .provider_editor
+        .as_ref()
+        .and_then(|editor| editor.selected_provider().map(|row| row.id.clone()));
+    assert_eq!(
+        editor_row.as_deref(),
+        Some("deepseek"),
+        "the panel opens focused on the provider the switcher could not switch to"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Provider discoverability: the settings panel must be reachable from what the
+// frame actually paints, not only from a shortcut the user has to know.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn provider_picker_pins_a_settings_entry_that_opens_on_click_and_ctrl_s() {
+    let (mut app, _temp) = test_app().await;
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let control = app.provider_control_rect.expect("provider control");
+
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("open");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let action = app
+        .provider_menu_geometry
+        .expect("geometry")
+        .action
+        .expect("pinned settings entry");
+    assert!(
+        app.provider_menu_open,
+        "the picker is open on the pinned row"
+    );
+    handle_terminal_event(&mut app, picker_click(action.x + 1, action.y))
+        .await
+        .expect("click the pinned entry");
+    assert!(
+        !app.provider_menu_open,
+        "the picker closes behind the panel"
+    );
+    assert!(
+        app.provider_editor.is_some(),
+        "clicking the pinned row opens the provider settings panel"
+    );
+
+    // Ctrl+S is the same entry from the keyboard, and it must be claimed by the
+    // picker before the shared "unhandled key dismisses" rule can swallow it.
+    app.provider_editor = None;
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("reopen");
+    assert!(app.provider_menu_open);
+    handle_terminal_event(
+        &mut app,
+        picker_key_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+s");
+    assert!(!app.provider_menu_open);
+    assert!(
+        app.provider_editor.is_some(),
+        "Ctrl+S inside the picker opens the same panel"
+    );
+}
+
+#[tokio::test]
+async fn footer_advertises_the_provider_entry_and_drops_the_repeated_mode() {
+    let (mut app, _temp) = test_app().await;
+    // Pin the key state: the ambient machine may or may not have a real key in
+    // its keyring, and this test is about the layout, not about key resolution.
+    app.provider_settings = Some(saved_provider_settings(&["openai"]));
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+
+    let footer = crate::ui_layout::compute_layout(
+        Rect::new(0, 0, 120, 40),
+        crate::ui_layout::Density::Wide,
+        crate::ui_layout::HeightClass::Normal,
+    )
+    .footer;
+    let hints = picker_row(&terminal, footer.y, 0, 120);
+    assert!(
+        hints.contains("Ctrl+S") && hints.contains("供应商设置"),
+        "the idle footer advertises the provider entry: {hints:?}"
+    );
+
+    // The provider pill is a control, so its hit rectangle covers the text that
+    // marks it as one, and the footer no longer repeats the mode that the input
+    // block's title already shows.
+    let control = app.provider_control_rect.expect("provider control");
+    let pill = picker_row(&terminal, control.y, control.x, control.right());
+    assert!(
+        pill.starts_with("⚙ ") && pill.ends_with(" ▾"),
+        "the pill marks itself as a control: {pill:?}"
+    );
+    let secondary = picker_row(&terminal, footer.y.saturating_add(1), 0, 120);
+    assert!(
+        !secondary.contains("构建"),
+        "the mode belongs to the input title only: {secondary:?}"
+    );
+    assert!(
+        secondary.contains(&app.provider_label()) && secondary.contains(app.model_name()),
+        "the secondary line still carries the provider and model: {secondary:?}"
+    );
+}
+
+#[tokio::test]
+async fn narrow_footer_keeps_the_provider_control_reachable() {
+    let (mut app, _temp) = test_app().await;
+    app.provider_settings = Some(saved_provider_settings(&["openai"]));
+    // 69 columns is the compact density: the footer drops the model name but
+    // must keep the provider control, which used to disappear entirely.
+    let backend = TestBackend::new(69, 20);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let control = app
+        .provider_control_rect
+        .expect("the provider control survives the compact density");
+    let pill = picker_row(&terminal, control.y, control.x, control.right());
+    assert!(
+        pill.contains(&app.provider_label()),
+        "the compact pill paints the provider it opens: {pill:?}"
+    );
+    handle_terminal_event(&mut app, picker_click(control.x, control.y))
+        .await
+        .expect("open");
+    assert!(
+        app.provider_menu_open,
+        "a compact terminal can still open the provider picker"
+    );
+
+    // The unresolved-key warning must not cost the narrow terminal its entry:
+    // the compact pill drops the suffix rather than overflowing the budget.
+    let (mut app, _temp) = test_app().await;
+    app.provider_settings = Some(ProviderSettingsDto {
+        active: saved_provider_settings(&["openai"]).active,
+        saved: Vec::new(),
+        connected: Vec::new(),
+    });
+    let backend = TestBackend::new(69, 20);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    let control = app
+        .provider_control_rect
+        .expect("an unresolved key still leaves a clickable provider pill");
+    let pill = picker_row(&terminal, control.y, control.x, control.right());
+    assert!(
+        pill.contains(&app.provider_label()) && pill.starts_with("⚙ ") && pill.ends_with(" ▾"),
+        "the compact pill stays whole while the activity line carries the warning: {pill:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unresolved_key_is_surfaced_once_and_retracted_when_it_resolves() {
+    let (mut app, _temp) = test_app().await;
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+
+    // `build_app` already seeded the core view; make the active provider
+    // unresolved and keep the transcript empty, which is the first screen.
+    app.provider_settings = Some(ProviderSettingsDto {
+        active: saved_provider_settings(&["openai"]).active,
+        saved: Vec::new(),
+        connected: Vec::new(),
+    });
+    app.current.entries.clear();
+    app.provider_hint_shown = false;
+    assert!(app.provider_needs_key());
+
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+    crate::app::provider::sync_provider_hint(&mut app);
+    assert!(app.provider_hint_shown);
+    assert_eq!(
+        app.current.entries.len(),
+        1,
+        "the first screen carries exactly one onboarding entry"
+    );
+
+    // Idempotent: a later sync never stacks a second copy.
+    crate::app::provider::sync_provider_hint(&mut app);
+    assert_eq!(app.current.entries.len(), 1);
+
+    // The footer says why the panel matters, instead of leaving a bare "ready".
+    let footer = crate::ui_layout::compute_layout(
+        Rect::new(0, 0, 120, 40),
+        crate::ui_layout::Density::Wide,
+        crate::ui_layout::HeightClass::Normal,
+    )
+    .footer;
+    let status = picker_row(&terminal, footer.y, 0, 120);
+    assert!(
+        status.contains("供应商未配置密钥"),
+        "the activity line reports the missing key: {status:?}"
+    );
+
+    // Once a key resolves the stale advice must go away on its own.
+    app.provider_settings = Some(saved_provider_settings(&["openai"]));
+    crate::app::provider::sync_provider_hint(&mut app);
+    assert!(
+        app.current.entries.is_empty(),
+        "the entry is retracted after the key resolves"
     );
 }

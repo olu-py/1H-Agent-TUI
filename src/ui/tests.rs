@@ -88,41 +88,31 @@ fn thinking_summary_folds_to_last_line_and_expands() {
 }
 
 #[test]
-fn settings_rows_group_fields_in_order() {
-    let rows = settings_rows();
-    let sections: Vec<&str> = rows
-        .iter()
-        .filter_map(|row| match row {
-            SettingsRow::Section(section) => Some(*section),
-            SettingsRow::Field(_)
-            | SettingsRow::Name
-            | SettingsRow::ContextWindow
-            | SettingsRow::Spacer => None,
-        })
-        .collect();
-    assert_eq!(sections, vec!["基础", "连接", "高级"]);
-
-    let fields: Vec<SettingsField> = rows
-        .iter()
-        .filter_map(|row| match row {
-            SettingsRow::Section(_)
-            | SettingsRow::Name
-            | SettingsRow::ContextWindow
-            | SettingsRow::Spacer => None,
-            SettingsRow::Field(field) => Some(*field),
-        })
-        .collect();
+fn the_editor_field_pane_orders_every_editable_row() {
+    // The right pane is a fixed reading order over the *same* rows the key
+    // handler walks, so the painted order and `field_index` cannot drift.
+    let labels: Vec<&str> = EDITOR_FIELDS.iter().map(|field| field.label()).collect();
     assert_eq!(
-        fields,
+        labels,
         vec![
-            SettingsField::Preset,
-            SettingsField::Protocol,
-            SettingsField::Model,
-            SettingsField::BaseUrl,
-            SettingsField::Thinking,
-            SettingsField::ApiKey,
+            "名称",
+            "模板",
+            "协议",
+            "模型",
+            "接口地址",
+            "上下文窗口",
+            "思考能力",
+            "API Key",
         ]
     );
+    // The template row is read-only: a profile's preset is its identity, so the
+    // core's own preset field is deliberately the one field with no editor row.
+    let core: Vec<SettingsField> = EDITOR_FIELDS
+        .iter()
+        .filter_map(|field| field.core())
+        .collect();
+    assert_eq!(core.len(), FIELDS.len() - 1);
+    assert!(!core.contains(&SettingsField::Preset));
 }
 
 #[test]
