@@ -41,14 +41,13 @@ pub(crate) fn model_choices(app: &App) -> Vec<ModelChoice> {
         .find(|model| model.id == current)
         .and_then(|model| model.context_window_tokens);
     push(current, current_window);
-    if let Some(settings) = &app.provider_settings {
-        if let Some(profile) = settings
+    if let Some(settings) = &app.provider_settings
+        && let Some(profile) = settings
             .saved
             .iter()
             .find(|profile| profile.id == active_id)
-        {
-            push(profile.model.clone(), None);
-        }
+    {
+        push(profile.model.clone(), None);
     }
     choices
 }
@@ -62,9 +61,9 @@ fn model_choice_label(id: &str, window: Option<u64>) -> String {
 }
 
 pub(super) fn compact_window(tokens: u64) -> String {
-    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
         format!("{}m", tokens / 1_000_000)
-    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
         format!("{}k", tokens / 1_000)
     } else if tokens >= 1_000 {
         format!("{:.1}k", tokens as f64 / 1_000.0)
@@ -496,11 +495,11 @@ pub(super) async fn handle_provider_menu_key(
     }
     let choices = provider_choices(app);
     move_menu_cursor(&mut app.provider_menu_selected, code, choices.len());
-    if code == KeyCode::Enter {
-        if let Some(choice) = choices.get(app.provider_menu_selected).cloned() {
-            close_footer_menus(app);
-            app.apply_provider_choice(choice.id).await?;
-        }
+    if code == KeyCode::Enter
+        && let Some(choice) = choices.get(app.provider_menu_selected).cloned()
+    {
+        close_footer_menus(app);
+        app.apply_provider_choice(choice.id).await?;
     }
     Ok(())
 }
@@ -567,12 +566,12 @@ pub(super) async fn handle_model_menu_key(app: &mut App, code: KeyCode) -> Resul
     }
     let choices = model_choices(app);
     move_menu_cursor(&mut app.model_menu_selected, code, choices.len());
-    if code == KeyCode::Enter {
-        if let Some(choice) = choices.get(app.model_menu_selected) {
-            let model = choice.id.clone();
-            close_footer_menus(app);
-            app.apply_model_choice(model).await?;
-        }
+    if code == KeyCode::Enter
+        && let Some(choice) = choices.get(app.model_menu_selected)
+    {
+        let model = choice.id.clone();
+        close_footer_menus(app);
+        app.apply_model_choice(model).await?;
     }
     Ok(())
 }
