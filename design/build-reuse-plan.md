@@ -1,6 +1,6 @@
 # 构建产物复用方案（workbase 三个 Rust 仓库）
 
-> 状态：**已实施并实测通过**（§11 为完整实测数字）。只解决"同一份中间产物被重复编译"，不含任何以压缩体积为目的的手段。
+> 状态：**已实施并实测通过**（§11 为完整实测数字）。只解决"同一份中间产物被重复编译"，不含任何以压缩体积为目的的手段。历史过程记录：其中的版本号、工具链与实测数字是当时快照，结论以 AGENTS.md 与 .agents/guides 为准。
 
 ## 0 一句话
 
@@ -80,7 +80,7 @@ sccache 确实能跨目录、跨工具链命中，但代价明确且本仓不划
 
 - 该键在 1.85 上被忽略，只多一行 warning（实测）。
 - **TUI 用 1.85 根本编不过**：`error: rustc 1.85.0 is not supported by the following packages: darling@0.24.1、globset@0.4.20、icu_*@2.3.0 requires rustc 1.88`。
-- 而且 TUI 的 `ci.yml` 里**没有** MSRV job——`minimum-rust`（toolchain 1.85.0）在 **core 仓库**的 `ci.yml` 里。所以历史那些 `-core-185`/`-core-msrv` 目录是 core 的 MSRV 复现，这条轴属于 core，不属于 TUI。
+- 而且（当时）TUI 的 `ci.yml` 里**没有** MSRV job——`minimum-rust`（toolchain 1.85.0）在 **core 仓库**的 `ci.yml` 里。所以历史那些 `-core-185`/`-core-msrv` 目录是 core 的 MSRV 复现，这条轴属于 core，不属于 TUI（**后续已变**：TUI 现在有自己的 `minimum-rust`（1.88.0）档位）。
 - 结论：core 的 MSRV 构建写进 core 默认 `target/`，与 stable 产物同目录、不同指纹、互不驱逐，repeat 往返均 0 重编（§11 K3–K5）。
 - **附带发现（不在本方案范围）**：TUI 声明的 `rust-version = "1.85"` 已与自己的 `Cargo.lock` 不兼容，且无 CI 覆盖，属于声明腐化。修法二选一——把 `rust-version` 提到 1.88，或在 TUI 的 ci.yml 补一个 `minimum-rust` job 把它变成真约束。**后续（已施工）**：两件都做了——`rust-version` 改为 `1.88`（先在本机核实过底线：`cargo +1.88.0 test --all-features --locked` 编译 249 个单元、26.5s、116 + 3 全通过），并在 TUI 的 ci.yml 补上 `minimum-rust` 档位。
 
@@ -98,7 +98,7 @@ sccache 确实能跨目录、跨工具链命中，但代价明确且本仓不划
 | A1 | 根下 `.cargo-target-*` 数量 = 0，每个仓库只有默认 `target/` | **通过**：0 个 |
 | A2 | stable 构建的中间产物落在共享缓存，target 目录只剩最终产物 | **通过**：TUI `target/` 3 个文件（跑完全部闸门后 8 个 = 2 个 bin + 2 个 PDB + 锁/标记），共享缓存 2538 个 |
 | A3 | 跨仓库复用：后建仓库的 `Compiling` 显著低于其依赖总数 | **通过**：webUI 首次 75（锁文件 359 包）、core 首次 62（锁文件 339 包） |
-| A4 | 工具链往返：`+1.85.0` → `+stable` → `+1.85.0`，第三轮 = 0 | **通过**：在 core 上测得 178 → 0 → 0（TUI 不适用，原因见 §5） |
+| A4 | 工具链往返：`+1.85.0` → `+stable` → `+1.85.0`，第三轮 = 0 | **通过**：在 core 上测得 178 → 0 → 0（当时 TUI 无 MSRV 档位，原因见 §5；现 TUI 已有 1.88 档位，同一机制适用） |
 | A5 | patch 往返：带 / 不带 patch，第三轮 = 0 | **通过**：2 → 0 → 0，且 `Compiling protium-core v0.5.0 (D:\workbase\1H-Agent-core)` 证明 patch 生效 |
 | A6 | 三个仓库跑完验证档位后 `D:\workbase` ≤ 25 GB | **通过**：**5.28 GB**（清理前 60.2 GB，约 11×） |
 | A7 | fmt / clippy `-D warnings` / 全量测试 / 文档校验 / 空白检查全绿 | **通过**：116 + 3 全过、clippy 0、docs check passed、`git diff --check` 0 |
@@ -110,7 +110,7 @@ sccache 确实能跨目录、跨工具链命中，但代价明确且本仓不划
 | `cargo clean` 清空共享缓存（实测 221→0） | 三个仓库一起冷启动 | AGENTS.md 已明令禁止；回收空间改为直接删 `.cargo-build-cache`；单包清理用 `clean -p`（实测精准） |
 | 1.85 不识别该键 | core 的 MSRV 构建各存一份 + 一行 warning | 已知成本；TUI 侧无影响（它本来就编不过 1.85） |
 | 单一构建锁 | rust-analyzer 与手动/代理构建互相等待 | 允许 IDE 另设一个目录；与 AGENTS.md 现有条目一致 |
-| `build-dir` 被官方标注"实现细节，可能无预警变更"（[cargo PR #15833](https://git.codeproxy.net/rust-lang/cargo/pull/15833#3)） | 升级工具链后行为可能变 | 升级后重跑 A2/A3；把它当成"两行可回退配置" |
+| `build-dir` 被官方标注"实现细节，可能无预警变更"（[cargo PR #15833](https://github.com/rust-lang/cargo/pull/15833)） | 升级工具链后行为可能变 | 升级后重跑 A2/A3；把它当成"两行可回退配置" |
 | 共享缓存无上限增长 | 盘占用随项目增多上升 | 本阶段不做自动回收；需要时整体删除 |
 | 共享缓存成为唯一副本 | 删掉它 = 全部冷启动 | 属预期；这也是"复用的代价是留着产物"的直接体现 |
 

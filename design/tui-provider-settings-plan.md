@@ -1,6 +1,6 @@
 # TUI 供应商界面制作计划
 
-> 状态：Phase 1 已实施；Phase 2+ 计划（未实施）
+> 状态：Phase 1 已实施；Phase 2+ 计划（未实施）。历史过程记录：结论以 AGENTS.md 与 .agents/guides 为准。
 > 更新时间：2026-09-28
 > 范围：`1H-Agent-TUI` 消费端。第一优先级是**让供应商面板有醒目入口**；其次才是面板本身与 WebUI 的功能对齐。
 > 参照实现：`1H-Agent-webUI`（`web/src/components/ProviderSettingsModal.tsx`、`ProviderSwitcher.tsx`、`web/src/lib/providers.ts`）。
