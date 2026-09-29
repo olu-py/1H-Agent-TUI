@@ -119,7 +119,10 @@ while IFS= read -r name; do
         *) expanded_names="${expanded_names}${name}"$'\n' ;;
     esac
 done <<< "$ci_names"
-doc_names="$(grep -F 'required checks' "$release_guide" | grep -oE '`[^`]+`' | tr -d '`' | sort -u)"
+# 取该行第一段"以顿号分隔的连续反引号串"——check 清单就是这种写法；行内别处的
+# 反引号（如 core 行首的 `main`、行尾的 `core-upgrade.yml`）不会被卷进来。
+doc_names="$(grep -F 'required checks' "$release_guide" \
+    | grep -oE '(`[^`]+`、)+`[^`]+`' | head -n1 | grep -oE '`[^`]+`' | tr -d '`' | sort -u)"
 test -n "$doc_names" || fail "release guide does not list required checks"
 ci_sorted="$(printf '%s' "$expanded_names" | sed '/^$/d' | sort -u)"
 missing_in_doc="$(comm -23 <(printf '%s\n' "$ci_sorted") <(printf '%s\n' "$doc_names"))"

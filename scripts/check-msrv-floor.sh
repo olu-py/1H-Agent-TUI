@@ -54,11 +54,19 @@ def key(value):
     return tuple(parts)
 
 
-packages = json.loads(sys.stdin.buffer.read().decode("utf-8"))["packages"]
-versions = [p["rust_version"] for p in packages if p.get("rust_version")]
+metadata = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+members = set(metadata["workspace_members"])
+versions = [
+    p["rust_version"]
+    for p in metadata["packages"]
+    if p.get("rust_version") and p["id"] not in members
+]
 print(max(versions, key=key) if versions else "")
 '
-floor="$(cargo metadata --locked --format-version 1 | "$interpreter" -c "$read_floor")"
+metadata="$(cargo metadata --locked --format-version 1)" \
+    || fail "cargo metadata failed; see the cargo error above for the manifest problem"
+floor="$(printf '%s' "$metadata" | "$interpreter" -c "$read_floor")" \
+    || fail "could not parse cargo metadata output"
 test -n "$floor" || fail "no dependency declares rust_version; cannot determine the floor"
 
 test "$(norm_version "$declared")" = "$(norm_version "$floor")" \
