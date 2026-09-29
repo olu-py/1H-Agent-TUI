@@ -40,7 +40,7 @@ Use this skill for end-to-end code delivery involving local commits, remote bran
 Direct `main` pushes are the exception, allowed only when **all** hold:
 
 1. The user explicitly requested a direct `main` push in the current task.
-2. Every changed file is documentation only: `*.md`, comment-only lines (`//`, `#`, `/*`, `*`, `<!--`, `;`), or pure formatting/line-ending changes.
+2. Every changed file is `*.md` — the guard accepts nothing else in a direct push; comment-only or line-ending-only edits to other files still require a PR.
 3. No `.github/workflows/**`, `Cargo.toml`, `Cargo.lock`, `src/**`, `crates/**` or `web/src/**` is touched — a one-line script change still requires a PR.
 4. Local checks pass: `git diff --check`; plus `bash scripts/check-agent-docs.sh` when repository docs changed.
 5. The push goes through `scripts/push.ps1 -Branch main -AllowMain` (fetch first, require local `main == origin/main`, stop if the remote moved).
