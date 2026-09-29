@@ -20,7 +20,7 @@ core `Engine`/`AppHandle` 生命周期主体：当前/后台 runtime 停放与�
 - `shutdown()` 必须先拒绝未决审批（oneshot `send(false)`）再 abort：abort 会 drop agent 持有的 receiver，后发必失败。
 - `Completed`/`Failed`/`Cancelled`/`LocalCommandFinished` 终态复位 `busy`/`active_task`；非终态事件不得复位。`Esc` 仅作用于当前会话。
 - `submit` 返回请求序号（`request_seq`，会话内单调递增）；`cancel(session, request_seq)` 只有序号仍匹配当前请求才生效，陈旧取消静默忽略、绝不误杀新请求。会话 busy/有未决审批/无 runner 时提交返回结构化 `Conflict`，消费端保留输入文本由用户重试。
-- 后台总量硬上限 `runtime.max_background_sessions`（clamp 2..=64，默认 8）：超限优先 LRU 淘汰空闲项，全忙时关停最旧项；当前会话不计入。淘汰后切回走 `build_runtime` 从存储重建。
+- 后台总量硬上限 `runtime.max_background_sessions`（clamp 2..=64，默认 8）：超限只淘汰**空闲**项（`idle()` 且 `parked_at` 最旧）；全忙时**绝不中断在跑任务**，而是拒绝切换并返回「后台会话容量已满」冲突，等任务结束后重试。当前会话不计入；淘汰后切回走 `build_runtime` 从存储重建。
 - `/delete` 软删整个子树（含后代）并按返回 id 关停全部对应 runtime、拒绝其审批、清理跟踪表；删除最后一个会话时新建替代会话。
 - `AppService::start` 先 `WorkspaceLock::acquire` 独占 canonical workspace，第二个程序打开同一 workspace 立即失败；drop 最后一个 `AppHandle` 才释放锁并收尾 engine 任务。
 - 消费端不拥有 runtime/审批 oneshot：adapter 断开重连必须先取 snapshot，再按 `event_cursor` replay 后 subscribe，游标逐出即 resync。
@@ -32,7 +32,7 @@ core `Engine`/`AppHandle` 生命周期主体：当前/后台 runtime 停放与�
 | --- | --- |
 | 删除后任务仍跑 | `deleted_ids` 覆盖 -> `shutdown` 调用 -> abort 顺序 |
 | 删除后审批悬空 | oneshot 拒绝先于 abort -> owner 路由 |
-| 后台内存增长 | 容量配置 -> 淘汰触发点（切换/终态事件） -> 全忙关停 |
+| 后台内存增长 | 容量配置 -> 淘汰触发点（切换/终态事件） -> 全忙时是否拒绝切换 |
 | 切回会话丢流式状态 | 是否被淘汰 -> `build_runtime` 重建路径 |
 | 面板残留子会话 | `refresh_sessions` 收敛 -> `child_batches`/`child_status` 清理 |
 | adapter 断连/重连丢事件 | 重连先 snapshot -> `event_cursor` replay -> subscribe 时序 -> 重复订阅 |
@@ -40,7 +40,7 @@ core `Engine`/`AppHandle` 生命周期主体：当前/后台 runtime 停放与�
 
 ## 验证
 
-- 迭代过滤器：`delete_`、`background_capacity`、`switching_session`、`handle_routed_event`、`workspace_lock`。
+- 迭代过滤器（这些名字定义在 core 测试，须在独立 `1H-Agent-core` 仓库运行；在本仓库 0 匹配时 `cargo test` 仍返回 0，会假绿）：`delete_`、`background_capacity`、`switching_session`、`handle_routed_event`、`workspace_lock`。
 - 生命周期、容量、取消或工作区锁协议变更升级到完整测试和 Clippy。
-- 新增 `AgentEvent` 变体需一次接通：agent 内 forward 闭包（`Forwarded::Send`/`SendIgnore`/`Ignore` 语义按需选）→ `session.rs handle_event` 穷尽 match → `app.rs` 路由/`should_coalesce_stream_redraw` 是否合并；压缩与子 agent 的 `|_| Ignore` 闭包自动忽略但行为要确认；跨层接线链（ModelEvent→AgentEvent→Event→消费端）见 UI Contract 专题。
+- 新增 `AgentEvent` 变体需一次接通：agent 内 forward 闭包（`Forwarded::Send`/`SendIgnore`/`Ignore` 语义按需选）→ `session.rs handle_event` 穷尽 match → core `app.rs` 路由 + 本仓库 `src/app/event_loop.rs` 的 `should_coalesce_stream_redraw` 是否该合并；压缩与子 agent 的 `|_| Ignore` 闭包自动忽略但行为要确认；跨层接线链（ModelEvent→AgentEvent→Event→消费端）见 UI Contract 专题。
 - app 层测试注意：`test_app` 构造的 `SessionRuntime` 含 tokio 组件，涉及审批/undo 的测试必须 `#[tokio::test]`；改 `resolve_approval` 等被测试直接调用的签名会连带旧调用点编译失败，改动时一并扫 `grep resolve_approval(`。

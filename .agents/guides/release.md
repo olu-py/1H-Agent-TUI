@@ -22,7 +22,7 @@
 - 归档保留 README、LICENSE、第三方声明和示例配置；Release 包含归档、DEB、MSI、checksums 和 notices。
 - 不假定本机有 `gh`；凭据不得进入命令、文件、日志或回复，Actions 使用最小权限 token。
 - required checks 保持 `Linux quality`、`Minimum Rust (1.88.0)`、`Test (macos-latest)`、`Test (windows-latest)`；实际 runner 固定 Ubuntu 24.04、macOS 26、Windows 2025。
-- Action 固定完整 SHA 并由每周 Dependabot 分组更新；checkout 不保留凭据，CI 仅允许 `main` 写缓存，release/自动升级只读。
+- Action 固定完整 SHA 并由每周 Dependabot 分组更新；checkout 不保留凭据；rust-cache 只在 `main` 的 CI 里写入（`save-if`，release 与自动升级均 `save-if: false`），但这些 workflow 仍各按需要写权限（自动升级写 PR、publish 写 Release）。
 
 ## 诊断
 
