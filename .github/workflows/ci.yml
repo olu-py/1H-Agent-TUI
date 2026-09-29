@@ -61,6 +61,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes libdbus-1-dev pkg-config
+      - name: Dependency MSRV floor
+        run: bash scripts/check-msrv-floor.sh
       - name: Tests
         run: cargo test --all-features --locked
 
