@@ -3,6 +3,61 @@ use protium_core::conformance::Expectation;
 use protium_core::protocol::MessagePage;
 
 #[test]
+fn resident_budget_tracks_deltas_without_visiting_unchanged_history() {
+    let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+    for _ in 0..899 {
+        projection.push_entry(DisplayEntry {
+            kind: DisplayKind::User,
+            content: DisplayContent::Markdown("history".repeat(20)),
+        });
+    }
+    projection.handle_event(&Event::TextDelta {
+        delta: "answer".into(),
+    });
+    let visits = projection.resident_byte_visits;
+    for _ in 0..100 {
+        projection.handle_event(&Event::TextDelta {
+            delta: " delta".into(),
+        });
+        assert_eq!(
+            projection.resident_bytes,
+            projection.entries.iter().map(entry_bytes).sum::<usize>()
+        );
+    }
+    assert_eq!(projection.resident_byte_visits - visits, 100);
+    // Exceeding the byte bound trims old entries, retaining all parallel indices.
+    projection.handle_event(&Event::TextDelta {
+        delta: "x".repeat(2 * 1024 * 1024),
+    });
+    assert!(projection.entries.is_empty());
+    assert_eq!(projection.resident_bytes, 0);
+    assert!(projection.entry_ids.is_empty());
+    assert!(projection.entry_revisions.is_empty());
+    assert!(projection.resident_entry_bytes.is_empty());
+}
+
+#[test]
+fn text_delta_advances_only_the_active_entry_revision() {
+    let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+    projection.push_entry(DisplayEntry {
+        kind: DisplayKind::User,
+        content: DisplayContent::Markdown("question".into()),
+    });
+    let user_id = projection.entry_ids[0];
+    projection.handle_event(&Event::TextDelta {
+        delta: "first".into(),
+    });
+    assert_eq!(projection.entry_revisions, [0, 0]);
+    projection.handle_event(&Event::TextDelta {
+        delta: " second".into(),
+    });
+    assert_eq!(projection.entry_revisions, [0, 1]);
+    assert_eq!(projection.entry_ids[0], user_id);
+    assert_eq!(projection.entry_ids.len(), projection.entries.len());
+    assert_eq!(projection.entries.len(), projection.entry_revisions.len());
+}
+
+#[test]
 fn usage_never_mutates_the_authoritative_context_meter() {
     let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, Some(1000));
     projection.handle_event(&Event::ContextUpdated {
@@ -195,6 +250,15 @@ fn apply_message_page_tracks_pagination_and_prepends_older() {
     let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
     // Fresh head page: newest 2 messages, older exist.
     projection.apply_message_page(&message_page(&[10, 11], Some(9), true), false);
+    let newest_id = projection.entry_ids[1];
+    projection.markdown_render_cache.insert(
+        newest_id,
+        CachedMarkdown {
+            revision: 0,
+            variant: 0,
+            lines: vec![ratatui::text::Line::default()],
+        },
+    );
     assert_eq!(projection.entries.len(), 2);
     assert_eq!(user_text(&projection.entries[0]), "msg 10");
     assert!(projection.history_has_more);
@@ -204,6 +268,8 @@ fn apply_message_page_tracks_pagination_and_prepends_older() {
     assert_eq!(projection.entries.len(), 5);
     assert_eq!(user_text(&projection.entries[0]), "msg 7");
     assert_eq!(user_text(&projection.entries[4]), "msg 11");
+    assert_eq!(projection.entry_ids[4], newest_id);
+    assert!(projection.markdown_render_cache.contains_key(&newest_id));
     assert!(projection.history_has_more);
     assert_eq!(projection.history_next_before, Some(6));
     // Head exhausted.
@@ -234,18 +300,9 @@ fn at_history_top_requires_more_history_and_top_scroll() {
     let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
     projection.apply_message_page(&message_page(&[10, 11], Some(9), true), false);
     assert!(!projection.at_history_top(), "no layout yet");
-    projection.message_layout = Some(MessageLayout {
-        viewport: ratatui::layout::Rect::new(0, 0, 80, 24),
-        width: 80,
-        scroll: 1,
-        text: String::new(),
-        lines: Vec::new(),
-        visual_lines: Vec::new(),
-        live_thinking_before: None,
-        live_thinking_rows: 0,
-        live_thinking_lines: Vec::new(),
-        live_thinking_clickable: true,
-    });
+    let mut layout = MessageLayout::new(vec![], ratatui::layout::Rect::new(0, 0, 80, 24), 0);
+    layout.scroll = 1;
+    projection.message_layout = Some(layout);
     projection.output_scroll_top = Some(0);
     projection.follow_output = false;
     assert!(projection.at_history_top());
@@ -564,6 +621,37 @@ fn reasoning_resumes_after_history_replace_without_losing_the_buffer() {
             })
             .force_redraw
     );
+}
+
+#[test]
+fn reasoning_live_line_preserves_unicode_graphemes_across_deltas() {
+    let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+    projection.handle_event(&Event::ReasoningDelta {
+        delta: format!("{}👩", "a".repeat(1018)),
+    });
+    projection.handle_event(&Event::ReasoningDelta {
+        delta: "\u{200d}".into(),
+    });
+    projection.handle_event(&Event::ReasoningDelta {
+        delta: "💻".into()
+    });
+    assert!(projection.thinking_last_line.ends_with("👩‍💻"));
+    assert!(projection.thinking_last_line.len() <= 1024);
+}
+
+#[test]
+fn reasoning_live_line_keeps_last_nonempty_line_and_bounds_the_buffer() {
+    let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+    projection.handle_event(&Event::ReasoningDelta {
+        delta: "prior nonempty\n   \n".into(),
+    });
+    assert_eq!(projection.thinking_last_line, "prior nonempty");
+    projection.handle_event(&Event::ReasoningDelta {
+        delta: "x".repeat(70_000),
+    });
+    assert!(projection.thinking_buffer_truncated);
+    assert!(projection.thinking_text().len() <= 64 * 1024);
+    assert!(projection.thinking_last_line.len() <= 1024);
 }
 
 #[test]

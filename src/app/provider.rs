@@ -173,7 +173,28 @@ fn is_provider_hint(entry: &DisplayEntry) -> bool {
 pub(super) fn sync_provider_hint(app: &mut App) {
     if !app.provider_needs_key() {
         if app.current.entries.iter().any(is_provider_hint) {
-            app.current.entries.retain(|entry| !is_provider_hint(entry));
+            let retained = app
+                .current
+                .entries
+                .iter()
+                .zip(&app.current.entry_revisions)
+                .zip(&app.current.entry_ids)
+                .filter(|((entry, _), _)| !is_provider_hint(entry))
+                .map(|((entry, revision), id)| (entry.clone(), *revision, *id))
+                .collect::<Vec<_>>();
+            app.current.entries = retained.iter().map(|(entry, _, _)| entry.clone()).collect();
+            app.current.entry_revisions =
+                retained.iter().map(|(_, revision, _)| *revision).collect();
+            app.current.entry_ids = retained.iter().map(|(_, _, id)| *id).collect();
+            let retained_ids = app
+                .current
+                .entry_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            app.current
+                .markdown_render_cache
+                .retain(|id, _| retained_ids.contains(id));
             app.current.invalidate_output_layout();
         }
         return;

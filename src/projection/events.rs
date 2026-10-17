@@ -14,9 +14,9 @@ impl TuiSessionProjection {
                 // when the buffer is empty, otherwise keep the buffered
                 // reasoning and just restore the anchor/active state.
                 if self.thinking_anchor.is_none()
-                    && (self.thinking_active || !self.thinking_buffer.is_empty())
+                    && (self.thinking_active || !self.thinking_text().is_empty())
                 {
-                    if self.thinking_buffer.is_empty() {
+                    if self.thinking_text().is_empty() {
                         self.begin_thinking();
                     } else {
                         self.thinking_active = true;
@@ -102,43 +102,52 @@ impl TuiSessionProjection {
                 snippet,
             } => {
                 let context = format!("{title}\n{url}\n{snippet}");
-                if let Some(tool) = self
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool)
-                            if tool.name == "web_search"
-                                && tool.status == ToolDisplayStatus::Running =>
-                        {
-                            Some(tool)
-                        }
-                        _ => None,
-                    })
+                if let Some(index) =
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, entry)| match &entry.content {
+                            DisplayContent::Tool(tool)
+                                if tool.name == "web_search"
+                                    && tool.status == ToolDisplayStatus::Running =>
+                            {
+                                Some(index)
+                            }
+                            _ => None,
+                        })
                 {
-                    let result = tool.result.get_or_insert_with(String::new);
-                    if !result.is_empty() {
-                        result.push_str("\n\n");
+                    if let DisplayContent::Tool(tool) = &mut self.entries[index].content {
+                        let result = tool.result.get_or_insert_with(String::new);
+                        if !result.is_empty() {
+                            result.push_str("\n\n");
+                        }
+                        result.push_str(&context);
                     }
-                    result.push_str(&context);
+                    self.bump_entry_revision(index);
+                    self.invalidate_output_layout();
                 }
             }
             Event::WebSearchCompleted { count } => {
-                if let Some(tool) = self
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool)
-                            if tool.name == "web_search"
-                                && tool.status == ToolDisplayStatus::Running =>
-                        {
-                            Some(tool)
-                        }
-                        _ => None,
-                    })
+                if let Some(index) =
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, entry)| match &entry.content {
+                            DisplayContent::Tool(tool)
+                                if tool.name == "web_search"
+                                    && tool.status == ToolDisplayStatus::Running =>
+                            {
+                                Some(index)
+                            }
+                            _ => None,
+                        })
                 {
-                    tool.status = ToolDisplayStatus::Completed;
+                    if let DisplayContent::Tool(tool) = &mut self.entries[index].content {
+                        tool.status = ToolDisplayStatus::Completed;
+                    }
+                    self.bump_entry_revision(index);
                     self.invalidate_output_layout();
                 }
                 self.agent_phase = AgentPhase::Thinking;
@@ -173,7 +182,6 @@ impl TuiSessionProjection {
                 self.finish_thinking("思考完成");
                 self.agent_phase = AgentPhase::StreamingText;
                 self.model_phase = ModelPhase::Streaming;
-                self.invalidate_output_layout();
                 if let Some(entry) = self.entries.last_mut()
                     && matches!(
                         entry.kind,
@@ -182,6 +190,10 @@ impl TuiSessionProjection {
                     && let DisplayContent::Markdown(text) = &mut entry.content
                 {
                     text.push_str(delta);
+                    if let Some(revision) = self.entry_revisions.last_mut() {
+                        *revision = revision.wrapping_add(1);
+                    }
+                    self.invalidate_output_tail(self.entries.len() - 1);
                 } else {
                     self.push_entry(DisplayEntry {
                         kind: DisplayKind::Assistant,
@@ -199,7 +211,7 @@ impl TuiSessionProjection {
                 // file_write payload can take seconds). Collapse any still-live
                 // reasoning into its summary exactly once, then show an animated
                 // "generating tool call" row so the screen never freezes.
-                if self.thinking_active || !self.thinking_buffer.is_empty() {
+                if self.thinking_active || !self.thinking_text().is_empty() {
                     self.finish_thinking("思考完成");
                 }
                 self.thinking_active = true;
@@ -261,19 +273,23 @@ impl TuiSessionProjection {
                 // transcript, so ToolStarted must be idempotent per call_id:
                 // reuse the existing card (refresh name/arguments, back to
                 // Running) instead of inserting a duplicate.
-                if let Some(tool) = self
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool) if tool.call_id == call.id => Some(tool),
-                        _ => None,
-                    })
+                if let Some(index) =
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, entry)| match &entry.content {
+                            DisplayContent::Tool(tool) if tool.call_id == call.id => Some(index),
+                            _ => None,
+                        })
                 {
-                    tool.name = call.name.clone();
-                    tool.arguments = call.arguments.clone();
-                    tool.status = ToolDisplayStatus::Running;
-                    tool.result = None;
+                    if let DisplayContent::Tool(tool) = &mut self.entries[index].content {
+                        tool.name = call.name.clone();
+                        tool.arguments = call.arguments.clone();
+                        tool.status = ToolDisplayStatus::Running;
+                        tool.result = None;
+                    }
+                    self.bump_entry_revision(index);
                     self.invalidate_output_layout();
                 } else {
                     self.push_entry(DisplayEntry {
@@ -292,17 +308,21 @@ impl TuiSessionProjection {
             Event::ToolFinished { call, result } => {
                 self.agent_phase = AgentPhase::Thinking;
                 let status = tool_result_status(result);
-                if let Some(tool) = self
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool) if tool.call_id == call.id => Some(tool),
-                        _ => None,
-                    })
+                if let Some(index) =
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, entry)| match &entry.content {
+                            DisplayContent::Tool(tool) if tool.call_id == call.id => Some(index),
+                            _ => None,
+                        })
                 {
-                    tool.status = status;
-                    tool.result = Some(result.clone());
+                    if let DisplayContent::Tool(tool) = &mut self.entries[index].content {
+                        tool.status = status;
+                        tool.result = Some(result.clone());
+                    }
+                    self.bump_entry_revision(index);
                     self.invalidate_output_layout();
                 } else {
                     self.push_entry(DisplayEntry {
@@ -433,6 +453,11 @@ impl TuiSessionProjection {
         self.thinking_active = true;
         self.thinking_last_line = "模型正在思考".into();
         self.thinking_buffer.clear();
+        self.thinking_buffer_start = 0;
+        self.thinking_buffer_last_newline = None;
+        self.thinking_current_line.clear();
+        self.thinking_previous_line.clear();
+        self.thinking_current_line_nonblank = false;
         self.thinking_buffer_truncated = false;
         self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
         self.live_thinking_layout_cache.clear();
@@ -460,9 +485,14 @@ impl TuiSessionProjection {
     /// and retires the live row.
     fn persist_thinking_summary(&mut self) {
         let truncated = self.thinking_buffer_truncated;
-        let reasoning = self.thinking_buffer.trim().to_owned();
+        let reasoning = self.thinking_text().trim().to_owned();
         self.thinking_buffer.clear();
+        self.thinking_buffer_start = 0;
+        self.thinking_buffer_last_newline = None;
         self.thinking_last_line.clear();
+        self.thinking_current_line.clear();
+        self.thinking_previous_line.clear();
+        self.thinking_current_line_nonblank = false;
         self.thinking_anchor = None;
         self.thinking_buffer_truncated = false;
         self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
@@ -493,6 +523,11 @@ impl TuiSessionProjection {
         self.thinking_active = false;
         self.thinking_last_line.clear();
         self.thinking_buffer.clear();
+        self.thinking_buffer_start = 0;
+        self.thinking_buffer_last_newline = None;
+        self.thinking_current_line.clear();
+        self.thinking_previous_line.clear();
+        self.thinking_current_line_nonblank = false;
         self.thinking_buffer_truncated = false;
         self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
         self.live_thinking_layout_cache.clear();
@@ -504,28 +539,124 @@ impl TuiSessionProjection {
     fn update_thinking_line(&mut self, delta: &str) {
         self.generating_tool = None;
         self.thinking_active = true;
-        self.thinking_buffer.push_str(delta);
-        if self.thinking_buffer.len() > MAX_THINKING_BUFFER_BYTES {
-            let minimum = self
-                .thinking_buffer
-                .len()
-                .saturating_sub(MAX_THINKING_BUFFER_BYTES);
-            let start = self
-                .thinking_buffer
-                .grapheme_indices(true)
-                .map(|(offset, _)| offset)
-                .find(|offset| *offset >= minimum)
-                .unwrap_or(self.thinking_buffer.len());
-            self.thinking_buffer.drain(..start);
-            self.thinking_buffer_truncated = true;
-            self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
+        self.append_thinking_line_delta(delta);
+        self.append_thinking_buffer(delta);
+        if self.thinking_current_line_nonblank {
+            self.thinking_last_line
+                .clone_from(&self.thinking_current_line);
+        } else if !self.thinking_previous_line.is_empty() {
+            self.thinking_last_line
+                .clone_from(&self.thinking_previous_line);
+        } else {
+            self.thinking_last_line.clear();
+            self.thinking_last_line.push_str("思考中");
         }
-        let latest = self
-            .thinking_buffer
+    }
+
+    fn append_thinking_line_delta(&mut self, delta: &str) {
+        let mut parts = delta.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            append_grapheme_tail_in_place(
+                &mut self.thinking_current_line,
+                part,
+                MAX_THINKING_LINE_BYTES,
+            );
+            self.thinking_current_line_nonblank |= !part.trim().is_empty();
+            if parts.peek().is_some() {
+                if self.thinking_current_line_nonblank {
+                    self.thinking_previous_line
+                        .clone_from(&self.thinking_current_line);
+                }
+                self.thinking_current_line.clear();
+                self.thinking_current_line_nonblank = false;
+            }
+        }
+    }
+
+    fn rebuild_thinking_line_cache(&mut self) {
+        let text = self.thinking_text();
+        let current_start = self
+            .thinking_buffer_last_newline
+            .map_or(0, |index| index - self.thinking_buffer_start + 1);
+        let completed = &text[..current_start.saturating_sub(1)];
+        let current = &text[current_start..];
+        let current_line = utf8_tail(current, MAX_THINKING_LINE_BYTES).to_owned();
+        let current_line_nonblank = !current.trim().is_empty();
+        let previous_line = completed
             .lines()
             .rev()
             .find(|line| !line.trim().is_empty())
-            .unwrap_or("思考中");
-        self.thinking_last_line = utf8_tail(latest, MAX_THINKING_LINE_BYTES).to_owned();
+            .map(|line| utf8_tail(line, MAX_THINKING_LINE_BYTES).to_owned())
+            .unwrap_or_default();
+        self.thinking_current_line = current_line;
+        self.thinking_current_line_nonblank = current_line_nonblank;
+        self.thinking_previous_line = previous_line;
+    }
+
+    fn append_thinking_buffer(&mut self, delta: &str) {
+        let mut remaining = delta;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(4096);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == 0 {
+                end = remaining.chars().next().unwrap().len_utf8();
+            }
+            if let Some(index) = remaining[..end].rfind('\n') {
+                self.thinking_buffer_last_newline = Some(self.thinking_buffer.len() + index);
+            }
+            self.thinking_buffer.push_str(&remaining[..end]);
+            self.trim_thinking_buffer();
+            remaining = &remaining[end..];
+        }
+    }
+
+    fn trim_thinking_buffer(&mut self) {
+        let visible_len = self.thinking_buffer.len() - self.thinking_buffer_start;
+        if visible_len <= MAX_THINKING_BUFFER_BYTES {
+            return;
+        }
+        let tail = utf8_tail(
+            &self.thinking_buffer[self.thinking_buffer_start..],
+            MAX_THINKING_BUFFER_BYTES,
+        );
+        self.thinking_buffer_start = self.thinking_buffer.len() - tail.len();
+        self.thinking_buffer_truncated = true;
+        self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
+        if self
+            .thinking_buffer_last_newline
+            .is_some_and(|index| index < self.thinking_buffer_start)
+        {
+            self.thinking_buffer_last_newline = None;
+        }
+        if self.thinking_buffer_start >= MAX_THINKING_BUFFER_BYTES / 8 {
+            self.thinking_buffer_last_newline = self
+                .thinking_buffer_last_newline
+                .map(|index| index - self.thinking_buffer_start);
+            self.thinking_buffer.drain(..self.thinking_buffer_start);
+            self.thinking_buffer_start = 0;
+        }
+        if self.thinking_buffer_last_newline.is_some() {
+            self.rebuild_thinking_line_cache();
+        } else {
+            self.thinking_previous_line.clear();
+        }
+    }
+}
+
+fn append_grapheme_tail_in_place(current: &mut String, delta: &str, max_bytes: usize) {
+    if delta.is_empty() {
+        return;
+    }
+    current.push_str(delta);
+    if current.len() > max_bytes {
+        let minimum = current.len().saturating_sub(max_bytes);
+        let start = current
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .find(|offset| *offset >= minimum)
+            .unwrap_or(current.len());
+        current.drain(..start);
     }
 }

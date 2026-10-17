@@ -7,7 +7,7 @@ TUI adapter 的职责边界：projection、输入、布局、渲染、滚动和�
 ## 入口
 
 - `src/app.rs`：TUI 门面 `App` 持有 `AppHandle` 与事件循环；`deferred_redraw_timer`、输入/菜单；所有变更经 `AppHandle` 提交。
-- `src/projection.rs`：`TuiSessionProjection` 的 revision、锚点和缓存失效。
+- `src/projection.rs`：revision、锚点、驻留费用缓存和失效；正文尾部 delta 只标记末段/重算该 entry 费用，draw 复用累计行前缀；`src/layout_work.rs` 后台完整核对首次/resize/prepend/通用失效。最多一个 active 和一个合并 pending，session/generation/viewport 匹配才原子安装布局及坐标/锚点；取消标志后 join 实际线程，完成经 Notify 唤醒；失败显示重试提示，新 generation 可恢复；三方单次解析不抢占，ACK 等线程结束。
 - `src/home.rs`：启动首页状态、响应式布局、有限最近会话、选择菜单和命中矩形。
 - `src/output.rs`：`LayoutLine`、`StyleRun`、visual line、选区和 hit-test。
 - `src/ui.rs`：`render_visual_line`、Markdown、实时思考缓存和 footer 控件矩形。
@@ -18,10 +18,10 @@ TUI adapter 的职责边界：projection、输入、布局、渲染、滚动和�
 - `TuiSessionProjection` 只保存展示状态（entries/todos/busy/thinking 等），不保存核心 runtime 或 oneshot。
 - 终态、`TranscriptInvalidated`、`ResyncRequired` 时从 snapshot/messages 重建展示状态，不依赖被淘汰或过期的本地增量；普通 snapshot 刷新不推进未消费的 `event_cursor`，只有首次连接、消费者滞后或 `ResyncRequired` 才建立新基线，避免跳过工具终态、思考屏障和正文 delta。
 - 逻辑行保存文本和 `StyleRun` 字节区间；可见行只切片相交段，不从行头扫描或逐字素建 Span。
-- Markdown/换行按 revision、宽度和展开状态缓存；摘要只失效目标条目，滚动/footer 不重解析正文。
+- Markdown/换行按 revision、宽度和展开状态缓存；分段内容经 Arc 共享，合成保留未变化前缀，尾部 revision 不复制历史文本/样式/视觉行；条目索引仍线性扫描，prepend/改宽或前部变更仍重建后缀。摘要只失效目标条目，滚动/footer 不重解析正文。
 - 跨 projection/ui 共享的展示 helper（如字节/工具名格式化）放 `projection.rs` 且 `pub(crate)`；与核心重复时两侧互相指向并注明为准者，避免各自漂移。
 - 实时思考分离动态标题与正文；追加只重排末尾，裁剪或改宽才全量重建；每帧只生成一次结果。工具参数流式时显示"生成工具调用"折叠动画行（`ToolCallStreaming` 驱动，复用 100ms 动画 tick），该行只读不可点击；中间同步丢弃的 live 锚点由后续 `ReasoningDelta` 或同步本身恢复，缓冲不丢。
-- 文本/reasoning delta 与滚轮共享固定 16 ms 帧；状态立即累计，后续事件不重置 deadline。
+- 文本/reasoning delta 与滚轮共享目标帧；`--refresh-rate-millihz` 默认 120000，物理呈现验收时传入已核验的桌面刷新率（例如 119880）。按该周期使用单调时钟绝对 deadline 跨帧维持相位，状态立即累计，后续事件不重置当前 timer；错过多个周期时跳过到未来周期，不追赶绘制。只在 dirty/动画活动时安排帧，空闲时不轮询；配置目标 cadence 不代表真实呈现证明。
 - 点击、键盘、审批、终态和 resize 即时绘制；live `Approval` 必须同步到 facade 的全局最旧审批并立即显示 modal，`ApprovalResolved` 清理匹配项后从 snapshot 收敛下一个审批，禁止只更新 session projection 导致 agent 隐形等待超时；工具开始/结束、联网搜索状态变化和本地 Shell 完成强制重绘，工具终态在下一轮模型事件到达前就必须可见；思考结束时摘要默认折叠、点击可重新展开；后台会话的 delta 与 todo 更新不重绘当前会话；边界无效滚动不安排帧。
 - 任务浮窗锚定 viewport 右下角，在消息内容之后渲染为顶层窗口；todo 更新不失效消息布局；状态符命中宽度固定为符号宽度；全部完成后自动折叠；关闭只隐藏当前会话浮窗不删任务，后续 todo 更新重新显示。
 - 编辑鼠标点击相关功能时，不得假定窗口内容行与业务项索引天然一致；省略提示、标题、边框、滚动、裁剪或换行都可能造成渲染行与命中行偏移，渲染与 hit-test 必须复用同一套行映射规则并覆盖偏移场景测试。
@@ -46,5 +46,5 @@ TUI adapter 的职责边界：projection、输入、布局、渲染、滚动和�
 ## 验证
 
 - 迭代过滤器按改动选择：`home::tests`、`app::tests`、`ui::tests`、`output::tests`、`ui_layout::tests`；协议事件相关改动回放核心共享夹具（`cargo test --lib conformance`：projection 终态断言 + facade cursor 去重）。
-- 性能回归优先使用具体行为名过滤器，避免迭代期重复运行整个模块。
+- 性能回归用具体行为名过滤器；`consumer` 基准的 `segment_tail_update` 比较合成成本。可设 `PROTIUM_TUI_FRAME_TRACE` 写入新 JSONL（最多 100000 帧、QPC），经 `scripts/collect-conpty.ps1` 对齐 OSC 帧标记；每帧 flush/标记会扰动时序，管道到达不是物理呈现，游标时间只表示最近应用事件。
 - 完成阶段按根文档运行一次 lib 测试；事件、缓存或选择跨模块变更升级到完整测试和 Clippy。

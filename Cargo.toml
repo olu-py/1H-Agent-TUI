@@ -26,7 +26,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = { workspace = true }
 ignore = { workspace = true }
 pulldown-cmark = { workspace = true }
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-backend-writer"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -89,7 +89,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-protium-core = { git = "https://github.com/olu-py/1H-Agent-core.git", rev = "d9d9e0c9889083a253ce4e2471fb702cf284a6c3" }
+protium-core = { git = "https://github.com/olu-py/1H-Agent-core.git", rev = "36616552505456c403443bedd031936ad408ac96" }
 
 [profile.release]
 opt-level = "s"

@@ -1,6 +1,33 @@
+use super::frame_trace::{DiagnosticWriter, tick};
 use super::*;
 
-pub async fn run(workspace_path: PathBuf, mut config: Config) -> Result<()> {
+type AppTerminal = Terminal<CrosstermBackend<DiagnosticWriter>>;
+
+fn draw_app(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
+    let tracing = terminal.backend_mut().writer_mut().enabled();
+    terminal
+        .backend_mut()
+        .writer_mut()
+        .begin_frame(app.event_cursor);
+    let mut layout_end = 0;
+    terminal.draw(|frame| {
+        ui::draw(frame, app);
+        if tracing {
+            layout_end = tick();
+        }
+    })?;
+    terminal
+        .backend_mut()
+        .writer_mut()
+        .finish_frame(layout_end)?;
+    Ok(())
+}
+
+pub async fn run(
+    workspace_path: PathBuf,
+    mut config: Config,
+    refresh_rate_millihz: u32,
+) -> Result<()> {
     let _workspace = Workspace::new(&workspace_path)?;
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("cannot create data directory {}", config.data_dir.display()))?;
@@ -16,6 +43,7 @@ pub async fn run(workspace_path: PathBuf, mut config: Config) -> Result<()> {
     };
     let handle = AppService::start(core_config).await?;
 
+    let diagnostic_stdout = DiagnosticWriter::new()?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(error) = execute!(
@@ -37,7 +65,7 @@ pub async fn run(workspace_path: PathBuf, mut config: Config) -> Result<()> {
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         )
     );
-    let backend = CrosstermBackend::new(stdout);
+    let backend = CrosstermBackend::new(diagnostic_stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -103,7 +131,12 @@ pub async fn run(workspace_path: PathBuf, mut config: Config) -> Result<()> {
             app.input.set(prompt);
             app.submit_current().await?;
         }
-        event_loop(&mut terminal, &mut app).await
+        event_loop(
+            &mut terminal,
+            &mut app,
+            frame_interval(refresh_rate_millihz),
+        )
+        .await
     }
     .await;
 
@@ -260,6 +293,7 @@ pub(super) async fn build_app(
         child_batches: HashMap::new(),
         active_session: active_session.clone(),
         current,
+        layout_work: crate::layout_work::LayoutWork::default(),
         approval: None,
         event_cursor: snapshot.event_cursor,
         should_quit: false,
@@ -298,10 +332,7 @@ pub(super) fn parse_phase(phase: &str) -> std::result::Result<AgentPhase, ()> {
     }
 }
 
-async fn home_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    home: &mut HomeState,
-) -> Result<HomeAction> {
+async fn home_event_loop(terminal: &mut AppTerminal, home: &mut HomeState) -> Result<HomeAction> {
     let mut terminal_events = EventStream::new();
     terminal.draw(|frame| home::draw(frame, home))?;
     loop {
@@ -319,11 +350,14 @@ async fn home_event_loop(
 }
 
 async fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut AppTerminal,
     app: &mut App,
+    redraw_interval: Duration,
 ) -> Result<()> {
+    let layout_notify = app.layout_work.notify.clone();
     let mut terminal_events = EventStream::new();
     let mut live = subscribe_live(app).await?;
+    let mut live_pending = false;
     let mut model_refresh_rx = app
         .model_refresh_rx
         .take()
@@ -331,7 +365,8 @@ async fn event_loop(
     let mut edge_scroll_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut thinking_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut deferred_redraw_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
-    terminal.draw(|frame| ui::draw(frame, app))?;
+    let mut next_deferred_redraw_deadline: Option<tokio::time::Instant> = None;
+    draw_app(terminal, app)?;
 
     while !app.should_quit {
         if app
@@ -382,8 +417,9 @@ async fn event_loop(
                 pending::<()>().await;
             }
         };
-        let mut redraw = false;
+        let mut redraw: bool;
         tokio::select! {
+            _ = layout_notify.notified() => { redraw = true; }
             refresh = model_refresh_rx.recv() => {
                 if let Some(refresh) = refresh {
                     apply_model_refresh_result(app, refresh);
@@ -394,6 +430,10 @@ async fn event_loop(
             }
             _ = deferred_redraw_tick => {
                 deferred_redraw_timer = None;
+                advance_deferred_redraw_deadline(
+                    &mut next_deferred_redraw_deadline,
+                    redraw_interval,
+                );
                 redraw = true;
             }
             _ = edge_scroll_tick => {
@@ -414,7 +454,11 @@ async fn event_loop(
                         let outcome = handle_terminal_event(app, event).await?;
                         redraw = outcome.redraw;
                         if redraw && coalesce {
-                            schedule_deferred_redraw(&mut deferred_redraw_timer);
+                            schedule_deferred_redraw(
+                                &mut deferred_redraw_timer,
+                                &mut next_deferred_redraw_deadline,
+                                redraw_interval,
+                            );
                             redraw = false;
                         }
                         if let Some(sequence) = outcome.osc52 {
@@ -430,69 +474,68 @@ async fn event_loop(
                     None => break,
                 }
             }
-            envelope = live.recv() => {
-                match envelope {
-                    Ok(envelope) => {
-                        let coalesce =
-                            should_coalesce_stream_redraw(&app.active_session, &envelope);
-                        if let Some(fresh_redraw) = accept_envelope(app, &envelope) {
-                            redraw = fresh_redraw;
-                            if redraw && coalesce {
-                                schedule_deferred_redraw(&mut deferred_redraw_timer);
-                                redraw = false;
-                            }
-                        }
+            wake = async {
+                if live_pending { Ok(()) } else { live.changed().await }
+            } => {
+                if wake.is_err() {
+                    break;
+                }
+                match drain_live_batch(
+                    app,
+                    terminal.backend_mut().writer_mut(),
+                    &mut deferred_redraw_timer,
+                    &mut next_deferred_redraw_deadline,
+                    redraw_interval,
+                ) {
+                    Some((changed, more)) => {
+                        live_pending = more;
+                        redraw = changed;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // The receiver fell behind the live broadcast. Refetch
-                        // snapshot + message page and subscribe with a fresh
-                        // receiver from the new cursor; never keep consuming the
-                        // stale one.
+                    None => {
                         app.sync_pending = false;
                         app.resync_all().await?;
                         live = subscribe_live(app).await?;
+                        live_pending = false;
                         redraw = true;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
         if redraw {
-            terminal.draw(|frame| ui::draw(frame, app))?;
+            draw_app(terminal, app)?;
         }
         if app.sync_pending {
             app.sync_pending = false;
             app.sync_all().await?;
-            terminal.draw(|frame| ui::draw(frame, app))?;
+            draw_app(terminal, app)?;
         }
         if app.history_load_pending {
             app.history_load_pending = false;
             app.load_older_history().await?;
-            terminal.draw(|frame| ui::draw(frame, app))?;
+            draw_app(terminal, app)?;
         }
     }
     app.cancel_model_refresh();
     Ok(())
 }
 
-/// Establishes a live subscription from the facade's last-processed cursor.
-/// The bridge subscribes atomically (live first, then ring snapshot), so every
-/// event pushed between the snapshot and the subscription is replayed exactly
-/// once. When the cursor has been evicted the facade refetches the snapshot and
-/// message page and retries from the fresh cursor. Returns a new live receiver.
-async fn subscribe_live(app: &mut App) -> Result<tokio::sync::broadcast::Receiver<Arc<Envelope>>> {
+/// Establishes a cursor subscription from the facade's last-processed cursor.
+/// The watch notification coalesces producer wakeups; events are read from the
+/// bounded replay ring. When the cursor was evicted, the facade refetches the
+/// snapshot and message page and retries from the fresh cursor.
+async fn subscribe_live(app: &mut App) -> Result<tokio::sync::watch::Receiver<u64>> {
     loop {
-        match app.handle.subscribe_from(app.event_cursor) {
+        match app.handle.subscribe_cursor_from(app.event_cursor) {
             Ok(subscription) => {
-                // Replay buffered events first, advancing the processed cursor
-                // so overlapping live deliveries are deduplicated.
+                // Replay buffered events first. A coalesced wakeup can cover
+                // the same events, so processing remains cursor guarded.
                 for envelope in &subscription.replay {
                     if envelope.cursor > app.event_cursor {
                         handle_envelope(app, envelope);
                         app.event_cursor = envelope.cursor;
                     }
                 }
-                return Ok(subscription.live);
+                return Ok(subscription.changed);
             }
             Err(protium_core::bridge::ResyncRequired) => {
                 // The requested cursor is gone; rebuild from a fresh snapshot
@@ -501,6 +544,44 @@ async fn subscribe_live(app: &mut App) -> Result<tokio::sync::broadcast::Receive
             }
         }
     }
+}
+
+/// Applies one bounded slice from the replay ring. `None` signals that the
+/// cursor was evicted and the caller must rebuild its snapshot.
+fn drain_live_batch(
+    app: &mut App,
+    trace: &mut DiagnosticWriter,
+    deferred_redraw_timer: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    next_deadline: &mut Option<tokio::time::Instant>,
+    redraw_interval: Duration,
+) -> Option<(bool, bool)> {
+    const EVENT_BATCH: usize = 128;
+    let events = app.handle.events_after(app.event_cursor, EVENT_BATCH)?;
+    let mut redraw = false;
+    let mut consumed = 0;
+    for envelope in &events {
+        if envelope.cursor <= app.event_cursor {
+            continue;
+        }
+        let coalesce = should_coalesce_stream_redraw(&app.active_session, envelope);
+        if let Some(fresh_redraw) = accept_envelope(app, envelope) {
+            if fresh_redraw && coalesce {
+                schedule_deferred_redraw(deferred_redraw_timer, next_deadline, redraw_interval);
+            } else if fresh_redraw {
+                redraw = true;
+            }
+        }
+        app.event_cursor = envelope.cursor;
+        trace.revision_received(envelope.cursor);
+        consumed += 1;
+        // Phase barriers and terminal states must draw before later deltas are
+        // applied, so leave the rest of this batch in the replay ring.
+        if redraw {
+            break;
+        }
+    }
+    let more = consumed < events.len() || app.event_cursor < app.handle.current_cursor();
+    Some((redraw, more))
 }
 
 /// Whether a stream event for the active session may be batched into the 16ms
@@ -529,8 +610,35 @@ fn should_coalesce_terminal_redraw(event: &Event) -> bool {
     )
 }
 
-fn schedule_deferred_redraw(timer: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+pub(super) fn schedule_deferred_redraw(
+    timer: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    next_deadline: &mut Option<tokio::time::Instant>,
+    interval: Duration,
+) {
     if timer.is_none() {
-        *timer = Some(Box::pin(tokio::time::sleep(DEFERRED_REDRAW_INTERVAL)));
+        let now = tokio::time::Instant::now();
+        let deadline = next_deadline.get_or_insert(now + interval);
+        while *deadline <= now {
+            *deadline += interval;
+        }
+        *timer = Some(Box::pin(tokio::time::sleep_until(*deadline)));
     }
+}
+
+pub(super) fn advance_deferred_redraw_deadline(
+    next_deadline: &mut Option<tokio::time::Instant>,
+    interval: Duration,
+) {
+    let Some(deadline) = next_deadline.as_mut() else {
+        return;
+    };
+    let now = tokio::time::Instant::now();
+    while *deadline <= now {
+        *deadline += interval;
+    }
+}
+
+pub(super) fn frame_interval(refresh_rate_millihz: u32) -> Duration {
+    let refresh_rate_millihz = u64::from(refresh_rate_millihz.clamp(1, 1_000_000));
+    Duration::from_nanos(1_000_000_000_000 / refresh_rate_millihz)
 }

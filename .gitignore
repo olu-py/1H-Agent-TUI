@@ -26,3 +26,10 @@ config.toml
 *.zip
 *.tar.gz
 PLAN.md
+
+# ---- 项目维护中间产物（不上传）----
+# design/ 仅本地留存任务期间的计划、设计与实施记录。
+/design/
+
+# Local test-run intermediate artifacts (test source stays in tests/).
+test/

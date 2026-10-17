@@ -56,7 +56,7 @@ protium-core
 ```
 
 - 核心独占 `SessionRuntime`/`AgentRunner`/Provider 与密钥/ToolRegistry 与 Security/Storage(SQLite)/审批 oneshot，以及命令串行队列与取消、关停逻辑；消费端不得触碰以上任何一项。
-- 消费端（TUI/WebUI/Desktop）只允许使用 `AppService::start(CoreConfig)`、`AppHandle` 的 snapshot/messages/submit/execute_command/approve/cancel/activate/set_provider/subscribe/shutdown 接口，以及 `protocol.rs` 的 DTO 与 `bridge.rs` 的原子订阅（`subscribe_from`/`ResyncRequired`）。`submit` 返回请求序号、`cancel` 携带之防陈旧取消。
+- 消费端（TUI/WebUI/Desktop）只允许使用 `AppService::start(CoreConfig)`、`AppHandle` 的 snapshot/messages/submit/request_sequence/execute_command/approve/cancel/activate/set_provider/subscribe/shutdown 接口，以及 `protocol.rs` 的 DTO 与 `bridge.rs` 的原子订阅（`subscribe_from`/`ResyncRequired`）。`submit` 返回请求序号、`cancel` 携带之防陈旧取消。
 - 消费端不解析 `AgentEvent` 或私有 JSON，只消费 `Envelope/Event`；Provider 私有协议先规范化为 `ModelEvent`，再经 protocol 映射给消费端。
 - 启动先取 snapshot，再 `subscribe_from(event_cursor)` 原子订阅并按 cursor 去重；游标逐出（`ResyncRequired`）或消费者滞后必须 resync（重取 snapshot + 消息页）。
 - TUI 是消费端 adapter：`App` 持有 `AppHandle` 与 `TuiSessionProjection`，经命令队列提交全部变更，不直接触碰核心；核心引擎独占会话状态，切换不停止后台任务；前端退出/断连不等于取消 agent。

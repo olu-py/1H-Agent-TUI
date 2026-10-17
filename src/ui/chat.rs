@@ -11,7 +11,12 @@ pub(super) fn draw_messages(
     update_message_layout(app, viewport);
     let Some(layout) = &app.current.message_layout else {
         frame.render_widget(
-            Paragraph::new(Vec::<Line<'static>>::new()).block(block),
+            Paragraph::new(if app.layout_work.error.is_some() {
+                vec![Line::from("布局失败，请调整窗口尺寸重试。")]
+            } else {
+                Vec::<Line<'static>>::new()
+            })
+            .block(block),
             area,
         );
         return;
@@ -40,30 +45,61 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
         .as_ref()
         .map(|layout| layout.width);
     let viewport_width = viewport.width.max(1) as usize;
-    if app.current.output_layout_dirty || app.current.message_layout.is_none() {
-        drop(app.current.message_layout.take());
-        let rendered = render_message_lines(app, viewport_width);
-        app.current.message_layout = Some(MessageLayout::new_with_interactions(
-            rendered.lines,
-            rendered.interactions,
-            viewport,
-            0,
-            rendered.thinking_before,
-        ));
-        #[cfg(test)]
-        {
-            app.current.output_layout_rebuild_count += 1;
-        }
-    } else if cached_width != Some(viewport_width) {
-        let layout = app
-            .current
-            .message_layout
-            .take()
-            .expect("layout existence was checked above");
-        app.current.message_layout = Some(layout.reflow(viewport));
-        #[cfg(test)]
-        {
-            app.current.output_layout_rebuild_count += 1;
+    if app.current.output_layout_dirty
+        || app.current.message_layout.is_none()
+        || cached_width != Some(viewport_width)
+    {
+        let tail_eligible = app.current.output_dirty_tail.is_some_and(|index| {
+            index + 1 == app.current.entries.len()
+                && app.current.thinking_anchor.is_none()
+                && app
+                    .current
+                    .retained_message_layout
+                    .as_ref()
+                    .is_some_and(|layout| {
+                        layout.width == viewport_width
+                            && layout.segment_count() == app.current.entries.len()
+                    })
+        });
+        if app.layout_work.enabled && !tail_eligible {
+            // Old coordinates are unavailable while a new viewport is being built.
+            if let Some(layout) = app.current.message_layout.take() {
+                app.current.retained_message_layout = Some(layout);
+            }
+            let Some(mut result) = app.layout_work.update(&app.current, viewport) else {
+                return;
+            };
+            // Keep the same body byte at the top after rewrapping; selection
+            // offsets, hit mapping and viewport all belong to the new layout.
+            if !app.current.follow_output {
+                let byte_anchor = app
+                    .current
+                    .retained_message_layout
+                    .as_ref()
+                    .filter(|old| old.width != viewport_width)
+                    .and_then(|old| old.visual_lines.get(old.scroll))
+                    .map(|line| line.start);
+                if let (Some(byte), Some(layout)) = (byte_anchor, result.message_layout.as_ref()) {
+                    app.current.output_scroll_top = layout.visual_lines.iter().position(|line| {
+                        !line.synthetic
+                            && (line.start == byte || line.start < byte && byte < line.end)
+                    });
+                }
+            }
+            app.current.message_layout = result.message_layout.take();
+            app.current.layout_segment_cache = result.layout_segment_cache;
+            app.current.markdown_render_cache = result.markdown_render_cache;
+            app.current.retained_message_layout = None;
+            #[cfg(test)]
+            {
+                app.current.output_layout_rebuild_count += result.output_layout_rebuild_count;
+                app.current.layout_segment_rebuild_count += result.layout_segment_rebuild_count;
+                app.current.layout_entry_visit_count += result.layout_entry_visit_count;
+                app.current.markdown_parse_count += result.markdown_parse_count;
+            }
+        } else {
+            app.layout_work.cancel_and_wait();
+            build_background_layout(&mut app.current, viewport);
         }
     } else if let Some(layout) = &mut app.current.message_layout {
         layout.update_viewport(viewport);
@@ -113,25 +149,168 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
         layout.set_scroll(scroll);
     }
     app.current.output_layout_dirty = false;
+    app.current.output_dirty_tail = None;
 }
 
-fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
+pub(crate) fn build_background_layout(
+    current: &mut crate::projection::TuiSessionProjection,
+    viewport: Rect,
+) {
+    let viewport_width = viewport.width.max(1) as usize;
+    let tail = current.output_dirty_tail.filter(|index| {
+        *index + 1 == current.entries.len()
+            && current.thinking_anchor.is_none()
+            && current
+                .retained_message_layout
+                .as_ref()
+                .is_some_and(|layout| {
+                    layout.width == viewport_width
+                        && layout.segment_count() == current.entries.len()
+                })
+    });
+    let prefix_lines = tail.map_or(0, |index| {
+        current
+            .retained_message_layout
+            .as_ref()
+            .unwrap()
+            .prefix_logical_lines(index)
+    });
+    let rendered = render_message_lines(current, viewport_width, tail.unwrap_or(0), prefix_lines);
+    if tail.is_none() {
+        let retained_ids = rendered
+            .segments
+            .iter()
+            .map(|(id, _, _, _, _)| *id)
+            .collect::<std::collections::HashSet<_>>();
+        current
+            .layout_segment_cache
+            .retain(|id, _| retained_ids.contains(id));
+    }
+    let mut segments = Vec::with_capacity(rendered.segments.len());
+    for (id, revision, variant, start, end) in rendered.segments {
+        if crate::layout_work::cancelled() {
+            return;
+        }
+        let cached = current
+            .layout_segment_cache
+            .get(&id)
+            .filter(|segment| {
+                segment.revision == revision
+                    && segment.width == viewport_width
+                    && segment.variant == variant
+            })
+            .cloned();
+        let segment = match cached {
+            Some(segment) => segment,
+            None => {
+                #[cfg(test)]
+                {
+                    current.layout_segment_rebuild_count += 1;
+                }
+                crate::output::CachedLayoutSegment::new(
+                    revision,
+                    viewport_width,
+                    variant,
+                    rendered.lines[start..end].to_vec(),
+                    rendered.interactions[start..end].to_vec(),
+                )
+            }
+        };
+        current.layout_segment_cache.insert(id, segment.clone());
+        segments.push(segment);
+    }
+    if let Some(mut layout) = current
+        .message_layout
+        .take()
+        .or_else(|| current.retained_message_layout.take())
+    {
+        if let Some(prefix) = tail {
+            layout.update_segment_suffix(prefix, &segments, viewport, rendered.thinking_before);
+        } else {
+            layout.update_segments(&segments, viewport, rendered.thinking_before);
+        }
+        current.message_layout = Some(layout);
+    } else {
+        current.message_layout = Some(MessageLayout::from_segments(
+            &segments,
+            viewport,
+            0,
+            rendered.thinking_before,
+        ));
+    }
+    #[cfg(test)]
+    {
+        current.output_layout_rebuild_count += 1;
+    }
+}
+
+fn render_message_lines(
+    current: &mut crate::projection::TuiSessionProjection,
+    width: usize,
+    first_entry: usize,
+    prefix_lines: usize,
+) -> RenderedMessageLines {
     let theme = UiTheme::default();
     let mut lines = Vec::new();
     let mut interactions = Vec::new();
     let mut thinking_before = None;
+    let mut cached_line_count = prefix_lines;
     let mut in_tool_group = false;
     let mut parsed_markdown = 0usize;
-    let current = &mut app.current;
+    let mut segments = Vec::with_capacity(current.entries.len() - first_entry);
     let entries = &current.entries;
     let expanded_tools = &current.expanded_tools;
     let expanded_thinking = &current.expanded_thinking;
+    let entry_revisions = &current.entry_revisions;
+    let entry_ids = &current.entry_ids;
     let thinking_anchor = current.thinking_anchor;
+    let layout_cache = &current.layout_segment_cache;
     let render_cache = &mut current.markdown_render_cache;
-    for (entry_index, entry) in entries.iter().enumerate() {
+    for (entry_index, entry) in entries.iter().enumerate().skip(first_entry) {
+        if crate::layout_work::cancelled() {
+            break;
+        }
         if thinking_anchor == Some(entry_index) {
-            thinking_before = Some(lines.len());
+            thinking_before = Some(lines.len() + cached_line_count);
             in_tool_group = false;
+        }
+        let segment_start = lines.len();
+        let segment_id = entry_ids
+            .get(entry_index)
+            .copied()
+            .unwrap_or(entry_index as u64);
+        let segment_revision = entry_revisions.get(entry_index).copied().unwrap_or(0);
+        let tool_group_ends = entries.get(entry_index + 1).is_none_or(|next| {
+            !matches!(next.content, DisplayContent::Tool(_))
+                || thinking_anchor == Some(entry_index + 1)
+        });
+        let segment_variant = match &entry.content {
+            DisplayContent::Tool(tool) => {
+                1 + u64::from(expanded_tools.contains(&tool.call_id)) * 2
+                    + u64::from(!in_tool_group) * 4
+                    + u64::from(tool_group_ends) * 8
+            }
+            DisplayContent::Thinking(thinking) => {
+                16 + u64::from(expanded_thinking.contains(&thinking.id))
+            }
+            DisplayContent::Diff(_) => 32 + entry_kind_variant(&entry.kind),
+            DisplayContent::Markdown(_) => 64 + entry_kind_variant(&entry.kind),
+        };
+        if let Some(cached) = layout_cache.get(&segment_id).filter(|segment| {
+            segment.revision == segment_revision
+                && segment.width == width
+                && segment.variant == segment_variant
+        }) {
+            cached_line_count += cached.logical_line_count();
+            segments.push((
+                segment_id,
+                segment_revision,
+                segment_variant,
+                segment_start,
+                lines.len(),
+            ));
+            in_tool_group = matches!(entry.content, DisplayContent::Tool(_)) && !tool_group_ends;
+            continue;
         }
         if let DisplayContent::Tool(tool) = &entry.content {
             if !in_tool_group {
@@ -150,14 +329,17 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
                 &mut lines,
                 &mut interactions,
             );
-            let group_ends = entries.get(entry_index + 1).is_none_or(|next| {
-                !matches!(next.content, DisplayContent::Tool(_))
-                    || thinking_anchor == Some(entry_index + 1)
-            });
-            if group_ends {
+            if tool_group_ends {
                 push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
                 in_tool_group = false;
             }
+            segments.push((
+                segment_id,
+                segment_revision,
+                segment_variant,
+                segment_start,
+                lines.len(),
+            ));
             continue;
         }
         in_tool_group = false;
@@ -166,10 +348,14 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
             let expanded_body = expanded.then(|| {
                 let (rendered, parsed) = cached_markdown(
                     render_cache,
-                    entry_index,
+                    entry_ids
+                        .get(entry_index)
+                        .copied()
+                        .unwrap_or(entry_index as u64),
                     &thinking.content,
                     theme.style(VisualRole::Primary),
                     1,
+                    entry_revisions.get(entry_index).copied().unwrap_or(0),
                 );
                 parsed_markdown += usize::from(parsed);
                 rendered
@@ -183,6 +369,13 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
                 &mut interactions,
             );
             push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
+            segments.push((
+                segment_id,
+                segment_revision,
+                segment_variant,
+                segment_start,
+                lines.len(),
+            ));
             continue;
         }
         if let DisplayContent::Markdown(text) = &entry.content
@@ -203,6 +396,13 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
                 None,
             );
             push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
+            segments.push((
+                segment_id,
+                segment_revision,
+                segment_variant,
+                segment_start,
+                lines.len(),
+            ));
             continue;
         }
         let (label, role) = match &entry.kind {
@@ -231,8 +431,17 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
                         None,
                     );
                 } else {
-                    let (rendered, parsed) =
-                        cached_markdown(render_cache, entry_index, text, content_style, 0);
+                    let (rendered, parsed) = cached_markdown(
+                        render_cache,
+                        entry_ids
+                            .get(entry_index)
+                            .copied()
+                            .unwrap_or(entry_index as u64),
+                        text,
+                        content_style,
+                        0,
+                        entry_revisions.get(entry_index).copied().unwrap_or(0),
+                    );
                     parsed_markdown += usize::from(parsed);
                     for line in rendered {
                         push_rendered_line(&mut lines, &mut interactions, line, None);
@@ -248,46 +457,66 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
             DisplayContent::Thinking(_) => unreachable!("thinking entries are rendered inline"),
         }
         push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
+        segments.push((
+            segment_id,
+            segment_revision,
+            segment_variant,
+            segment_start,
+            lines.len(),
+        ));
     }
     if thinking_anchor.is_some() && thinking_before.is_none() {
-        thinking_before = Some(lines.len());
+        thinking_before = Some(lines.len() + cached_line_count);
     }
     #[cfg(test)]
     {
         current.markdown_parse_count += parsed_markdown;
+        current.layout_entry_visit_count += entries.len() - first_entry;
     }
     RenderedMessageLines {
         lines,
         interactions,
         thinking_before,
+        segments,
     }
 }
 
 fn cached_markdown(
-    cache: &mut std::collections::HashMap<usize, crate::output::CachedMarkdown>,
-    entry_index: usize,
+    cache: &mut std::collections::HashMap<u64, crate::output::CachedMarkdown>,
+    entry_id: u64,
     text: &str,
     base: Style,
     variant: u8,
+    revision: u64,
 ) -> (Vec<Line<'static>>, bool) {
-    let mut hasher = DefaultHasher::new();
-    variant.hash(&mut hasher);
-    text.hash(&mut hasher);
-    let fingerprint = hasher.finish();
-    if let Some(cached) = cache.get(&entry_index)
-        && cached.fingerprint == fingerprint
+    if let Some(cached) = cache.get(&entry_id)
+        && cached.revision == revision
+        && cached.variant == variant
     {
         return (cached.lines.clone(), false);
     }
     let lines = render_markdown(text, base);
     cache.insert(
-        entry_index,
+        entry_id,
         crate::output::CachedMarkdown {
-            fingerprint,
+            revision,
+            variant,
             lines: lines.clone(),
         },
     );
     (lines, true)
+}
+
+fn entry_kind_variant(kind: &DisplayKind) -> u64 {
+    match kind {
+        DisplayKind::User => 0,
+        DisplayKind::Assistant => 1,
+        DisplayKind::AssistantPartial => 2,
+        DisplayKind::Thinking => 3,
+        DisplayKind::Tool => 4,
+        DisplayKind::Error => 5,
+        DisplayKind::System => 6,
+    }
 }
 
 fn push_rendered_line(
@@ -457,6 +686,9 @@ impl MarkdownRenderer {
         I: IntoIterator<Item = (Event<'a>, Range<usize>)>,
     {
         for (event, range) in events {
+            if crate::layout_work::cancelled() {
+                break;
+            }
             self.event_spacing(source, range.start, &event);
             self.event(event);
         }
@@ -783,6 +1015,9 @@ impl MarkdownRenderer {
             return;
         }
         for (index, part) in text.split('\n').enumerate() {
+            if crate::layout_work::cancelled() {
+                break;
+            }
             if index > 0 {
                 self.flush_line(true);
             }
@@ -842,6 +1077,9 @@ fn render_table(table: TableState) -> Vec<Line<'static>> {
     }
     let mut widths = vec![3; column_count];
     for row in &table.rows {
+        if crate::layout_work::cancelled() {
+            break;
+        }
         for (column, cell) in row.cells.iter().enumerate() {
             let width = cell
                 .iter()
@@ -854,6 +1092,9 @@ fn render_table(table: TableState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut rendered_header = false;
     for row in table.rows {
+        if crate::layout_work::cancelled() {
+            break;
+        }
         let mut spans = vec![Span::styled("| ", table_border_style())];
         for (column, width) in widths.iter().enumerate() {
             let cell = row.cells.get(column).cloned().unwrap_or_default();
@@ -1043,6 +1284,9 @@ pub(super) fn render_tool(
     match tool.result.as_deref() {
         Some(result) if !result.is_empty() => {
             for line in result.lines() {
+                if crate::layout_work::cancelled() {
+                    break;
+                }
                 push_rendered_line(
                     lines,
                     interactions,
@@ -1345,7 +1589,7 @@ fn live_thinking_lines_cached(
     };
     let title = fit_text_tail(&title, width);
 
-    let buffer = &app.current.thinking_buffer;
+    let buffer = &app.current.thinking_buffer[app.current.thinking_buffer_start..];
     let reasoning = buffer.trim();
     if reasoning.is_empty() {
         let mut lines = vec![title.clone()];
@@ -1489,7 +1733,7 @@ fn live_thinking_lines_with_braille(app: &App, width: usize, braille: bool) -> V
     if app.current.thinking_buffer_truncated {
         lines.extend(wrap_grapheme_lines("  [较早思考内容已截断]", width));
     }
-    let reasoning = app.current.thinking_buffer.trim();
+    let reasoning = app.current.thinking_buffer[app.current.thinking_buffer_start..].trim();
     if reasoning.is_empty() {
         lines.extend(wrap_grapheme_lines(
             &format!("  {}", app.current.thinking_last_line),

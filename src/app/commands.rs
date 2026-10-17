@@ -383,6 +383,8 @@ impl App {
             Command::Clear => {
                 self.current.invalidate_output_layout();
                 self.current.entries.clear();
+                self.current.entry_revisions.clear();
+                self.current.entry_ids.clear();
                 self.current.reset_thinking_state();
                 self.current.clear_output_selection();
                 self.current.status = "显示已清空，会话历史仍保留".into();

@@ -5,8 +5,11 @@ impl TuiSessionProjection {
     /// drops transient streaming/thinking/scroll state.
     pub fn replace_history(&mut self, entries: Vec<DisplayEntry>) {
         self.entries = entries;
+        self.entry_revisions = vec![0; self.entries.len()];
+        self.entry_ids = allocate_ids(self, self.entries.len());
         self.invalidate_output_layout();
         self.markdown_render_cache.clear();
+        self.layout_segment_cache.clear();
         self.clear_output_selection();
         self.thinking_anchor = None;
         self.scroll_to_bottom();
@@ -32,11 +35,16 @@ impl TuiSessionProjection {
             // against the grown layout.
             let anchor = self.message_scroll;
             let old = std::mem::take(&mut self.entries);
+            let old_revisions = std::mem::take(&mut self.entry_revisions);
+            let old_ids = std::mem::take(&mut self.entry_ids);
             let mut merged = entries;
+            self.entry_revisions = vec![0; merged.len()];
+            self.entry_ids = allocate_ids(self, merged.len());
             merged.extend(old);
+            self.entry_revisions.extend(old_revisions);
+            self.entry_ids.extend(old_ids);
             self.entries = merged;
             self.invalidate_output_layout();
-            self.markdown_render_cache.clear();
             self.clear_output_selection();
             self.output_scroll_top = None;
             self.follow_output = false;
@@ -47,10 +55,16 @@ impl TuiSessionProjection {
             // preserving the content currently being inspected.
             let removed = trim_entries_from_end(&mut self.entries);
             if removed > 0 {
+                self.entry_revisions.truncate(self.entries.len());
+                self.entry_ids.truncate(self.entries.len());
                 self.invalidate_output_layout();
-                self.markdown_render_cache.clear();
                 self.clear_output_selection();
             }
+            let retained_ids = self.entry_ids.iter().copied().collect::<HashSet<_>>();
+            self.markdown_render_cache
+                .retain(|id, _| retained_ids.contains(id));
+            self.layout_segment_cache
+                .retain(|id, _| retained_ids.contains(id));
         } else {
             self.replace_history(entries);
         }
@@ -87,8 +101,22 @@ impl TuiSessionProjection {
         if current == incoming {
             return;
         }
-        self.entries
-            .retain(|entry| !matches!(entry.kind, DisplayKind::AssistantPartial));
+        let retained = self
+            .entries
+            .iter()
+            .zip(&self.entry_revisions)
+            .zip(&self.entry_ids)
+            .filter(|((entry, _), _)| !matches!(entry.kind, DisplayKind::AssistantPartial))
+            .map(|((entry, revision), id)| (entry.clone(), *revision, *id))
+            .collect::<Vec<_>>();
+        self.entries = retained.iter().map(|(entry, _, _)| entry.clone()).collect();
+        self.entry_revisions = retained.iter().map(|(_, revision, _)| *revision).collect();
+        self.entry_ids = retained.iter().map(|(_, _, id)| *id).collect();
+        let retained_ids = self.entry_ids.iter().copied().collect::<HashSet<_>>();
+        self.markdown_render_cache
+            .retain(|id, _| retained_ids.contains(id));
+        self.layout_segment_cache
+            .retain(|id, _| retained_ids.contains(id));
         if let Some(partial) = partial
             && !partial.content.trim().is_empty()
         {
@@ -208,4 +236,8 @@ impl TuiSessionProjection {
         }
         entries
     }
+}
+
+fn allocate_ids(projection: &mut TuiSessionProjection, count: usize) -> Vec<u64> {
+    (0..count).map(|_| projection.allocate_entry_id()).collect()
 }

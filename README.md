@@ -41,6 +41,8 @@ cd 1H-Agent
 cargo run --locked --bin 1h-agent -- --workspace /path/to/project
 ```
 
+TUI 流式重绘目标默认为 120 Hz。物理呈现测试应先核实桌面刷新率，再用 `--refresh-rate-millihz` 传入毫赫兹值；例如 119.88 Hz 使用 `--refresh-rate-millihz 119880`。
+
 应用每次启动先进入轻量首页。直接输入首条消息并按 `Enter` 会创建新会话并进入主界面；按 `Tab` 可切换到最近会话列表，使用方向键和 `Enter` 恢复会话，也可以直接点击会话标题。首页不会预先创建空会话或加载历史消息。
 
 ### Windows 启动脚本
@@ -91,6 +93,8 @@ cargo build --release --locked --bin 1h-agent
 ```bash
 cargo bench --bench consumer --locked
 ```
+
+120Hz性能计划已按用户调整后的目标完成并验收（2026-10-18）。该计划的软件帧工作硬门槛为P95≤8.3ms、P99≤8.3ms；原P95≤4ms、P99≤6ms保留为研发目标。历史测量按各自构建与当时口径归档。
 
 ## 更新 protium-core
 

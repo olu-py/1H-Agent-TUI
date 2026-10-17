@@ -19,7 +19,9 @@ use protium_core::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::output::{CachedMarkdown, EdgeScroll, MessageLayout, OutputSelection};
+use crate::output::{
+    CachedLayoutSegment, CachedMarkdown, EdgeScroll, MessageLayout, OutputSelection,
+};
 
 /// A pending approval surfaced to the TUI. Only the consumer-facing id, the
 /// tool call and the reason cross the boundary; the oneshot sender lives in
@@ -81,6 +83,16 @@ pub struct TuiSessionProjection {
     pub title: String,
     pub parent_id: Option<String>,
     pub entries: Vec<DisplayEntry>,
+    /// Monotonic content revision per display entry. Stable entries can reuse
+    /// parsed markdown without hashing the full transcript each frame.
+    pub(crate) entry_revisions: Vec<u64>,
+    pub(crate) entry_ids: Vec<u64>,
+    next_entry_id: u64,
+    resident_entry_bytes: Vec<usize>,
+    resident_bytes: usize,
+    resident_bytes_dirty: bool,
+    #[cfg(test)]
+    resident_byte_visits: usize,
     pub todos: Vec<TodoTask>,
     pub todo_collapsed: bool,
     pub todo_hidden: bool,
@@ -93,6 +105,11 @@ pub struct TuiSessionProjection {
     pub thinking_active: bool,
     pub thinking_last_line: String,
     pub thinking_buffer: String,
+    pub(crate) thinking_buffer_start: usize,
+    pub(crate) thinking_buffer_last_newline: Option<usize>,
+    pub(crate) thinking_current_line: String,
+    pub(crate) thinking_previous_line: String,
+    pub(crate) thinking_current_line_nonblank: bool,
     pub thinking_buffer_truncated: bool,
     pub thinking_buffer_epoch: u64,
     pub thinking_result: ThinkingResult,
@@ -124,8 +141,16 @@ pub struct TuiSessionProjection {
     pub output_scroll_top: Option<usize>,
     pub output_selection: Option<OutputSelection>,
     pub message_layout: Option<MessageLayout>,
-    pub markdown_render_cache: HashMap<usize, CachedMarkdown>,
+    /// Reuse allocation/content on the next draw, without exposing stale
+    /// coordinates to selection or hit testing while the layout is dirty.
+    pub(crate) retained_message_layout: Option<MessageLayout>,
+    pub markdown_render_cache: HashMap<u64, CachedMarkdown>,
+    pub(crate) layout_segment_cache: HashMap<u64, CachedLayoutSegment>,
     pub output_layout_dirty: bool,
+    /// A protocol tail delta can reuse the retained prefix without scanning it.
+    /// None requires the general identity/variant reconciliation path.
+    pub(crate) output_dirty_tail: Option<usize>,
+    pub(crate) output_generation: u64,
     /// Whether older messages exist beyond the loaded history head (from the
     /// last message page's `has_more`), and the opaque cursor to fetch them.
     pub history_has_more: bool,
@@ -135,6 +160,10 @@ pub struct TuiSessionProjection {
     #[cfg(test)]
     pub markdown_parse_count: usize,
     #[cfg(test)]
+    pub layout_segment_rebuild_count: usize,
+    #[cfg(test)]
+    pub layout_entry_visit_count: usize,
+    #[cfg(test)]
     pub footer_rebuild_count: usize,
     pub edge_scroll: EdgeScroll,
 }
@@ -143,6 +172,10 @@ pub(crate) const MAX_THINKING_LINE_BYTES: usize = 1024;
 pub(crate) const MAX_THINKING_BUFFER_BYTES: usize = 64 * 1024;
 
 impl TuiSessionProjection {
+    pub(crate) fn thinking_text(&self) -> &str {
+        &self.thinking_buffer[self.thinking_buffer_start..]
+    }
+
     /// A fresh, empty projection for a session (used before the first message
     /// page arrives).
     pub fn new(session_id: String, mode: AgentMode, context_limit_tokens: Option<u64>) -> Self {
@@ -151,6 +184,14 @@ impl TuiSessionProjection {
             title: String::new(),
             parent_id: None,
             entries: Vec::new(),
+            entry_revisions: Vec::new(),
+            entry_ids: Vec::new(),
+            next_entry_id: 1,
+            resident_entry_bytes: Vec::new(),
+            resident_bytes: 0,
+            resident_bytes_dirty: true,
+            #[cfg(test)]
+            resident_byte_visits: 0,
             todos: Vec::new(),
             todo_collapsed: false,
             todo_hidden: false,
@@ -163,6 +204,11 @@ impl TuiSessionProjection {
             thinking_active: false,
             thinking_last_line: String::new(),
             thinking_buffer: String::new(),
+            thinking_buffer_start: 0,
+            thinking_buffer_last_newline: None,
+            thinking_current_line: String::new(),
+            thinking_previous_line: String::new(),
+            thinking_current_line_nonblank: false,
             thinking_buffer_truncated: false,
             thinking_buffer_epoch: 0,
             thinking_result: ThinkingResult::Completed,
@@ -184,14 +230,22 @@ impl TuiSessionProjection {
             output_scroll_top: None,
             output_selection: None,
             message_layout: None,
+            retained_message_layout: None,
             markdown_render_cache: HashMap::new(),
+            layout_segment_cache: HashMap::new(),
             output_layout_dirty: true,
+            output_dirty_tail: None,
+            output_generation: 1,
             history_has_more: false,
             history_next_before: None,
             #[cfg(test)]
             output_layout_rebuild_count: 0,
             #[cfg(test)]
             markdown_parse_count: 0,
+            #[cfg(test)]
+            layout_segment_rebuild_count: 0,
+            #[cfg(test)]
+            layout_entry_visit_count: 0,
             #[cfg(test)]
             footer_rebuild_count: 0,
             edge_scroll: EdgeScroll::default(),
@@ -211,6 +265,15 @@ impl TuiSessionProjection {
         self.clear_output_selection();
         self.invalidate_output_layout();
         self.entries.push(entry);
+        self.entry_revisions.push(0);
+        let id = self.allocate_entry_id();
+        self.entry_ids.push(id);
+    }
+
+    pub(crate) fn allocate_entry_id(&mut self) -> u64 {
+        let id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1).max(1);
+        id
     }
 
     pub fn clear_output_selection(&mut self) {
@@ -230,19 +293,89 @@ impl TuiSessionProjection {
     }
 
     pub fn invalidate_output_layout(&mut self) {
-        self.message_layout.take();
+        self.resident_bytes_dirty = true;
+        self.output_dirty_tail = None;
+        self.retain_output_layout();
+    }
+
+    pub(crate) fn invalidate_output_tail(&mut self, index: usize) {
+        if !self.resident_bytes_dirty && self.resident_entry_bytes.len() == self.entries.len() {
+            let bytes = entry_bytes(&self.entries[index]);
+            self.resident_bytes = self.resident_bytes - self.resident_entry_bytes[index] + bytes;
+            self.resident_entry_bytes[index] = bytes;
+            #[cfg(test)]
+            {
+                self.resident_byte_visits += 1;
+            }
+        }
+        if !self.output_layout_dirty {
+            self.output_dirty_tail = Some(index);
+        } else if self.output_dirty_tail != Some(index) {
+            self.output_dirty_tail = None;
+        }
+        self.retain_output_layout();
+    }
+
+    fn retain_output_layout(&mut self) {
+        self.output_generation = self.output_generation.wrapping_add(1);
+        if let Some(layout) = self.message_layout.take() {
+            self.retained_message_layout = Some(layout);
+        }
         self.output_layout_dirty = true;
+    }
+
+    pub(crate) fn layout_snapshot(&self) -> Self {
+        let mut snapshot = Self::new(
+            self.session_id.clone(),
+            self.mode,
+            self.context_limit_tokens,
+        );
+        snapshot.entries = self.entries.clone();
+        snapshot.entry_ids = self.entry_ids.clone();
+        snapshot.entry_revisions = self.entry_revisions.clone();
+        snapshot.expanded_tools = self.expanded_tools.clone();
+        snapshot.expanded_thinking = self.expanded_thinking.clone();
+        snapshot.thinking_anchor = self.thinking_anchor;
+        snapshot.markdown_render_cache = self.markdown_render_cache.clone();
+        snapshot.layout_segment_cache = self.layout_segment_cache.clone();
+        snapshot.output_generation = self.output_generation;
+        snapshot
+    }
+
+    pub(crate) fn bump_entry_revision(&mut self, index: usize) {
+        if let Some(revision) = self.entry_revisions.get_mut(index) {
+            *revision = revision.wrapping_add(1);
+        }
     }
 
     pub fn trim_entries(&mut self) {
         const MAX_ENTRIES: usize = 1000;
         const MAX_BYTES: usize = 2 * 1024 * 1024;
-        if self.entries.len() <= MAX_ENTRIES && display_entry_bytes(&self.entries) <= MAX_BYTES {
+        if self.resident_bytes_dirty || self.resident_entry_bytes.len() != self.entries.len() {
+            self.resident_entry_bytes = self.entries.iter().map(entry_bytes).collect();
+            self.resident_bytes = self.resident_entry_bytes.iter().sum();
+            self.resident_bytes_dirty = false;
+            #[cfg(test)]
+            {
+                self.resident_byte_visits += self.entries.len();
+            }
+        }
+        if self.entries.len() <= MAX_ENTRIES && self.resident_bytes <= MAX_BYTES {
             return;
         }
         self.invalidate_output_layout();
-        let removed = trim_entries(&mut self.entries);
+        let removed = trim_entries(
+            &mut self.entries,
+            &self.resident_entry_bytes,
+            &mut self.resident_bytes,
+        );
+        self.resident_entry_bytes.drain(..removed);
+        self.resident_bytes_dirty = false;
+        self.entry_revisions
+            .drain(..removed.min(self.entry_revisions.len()));
+        self.entry_ids.drain(..removed.min(self.entry_ids.len()));
         self.markdown_render_cache.clear();
+        self.layout_segment_cache.clear();
         self.thinking_anchor = self
             .thinking_anchor
             .map(|anchor| anchor.saturating_sub(removed));
@@ -390,33 +523,25 @@ fn utf8_tail(value: &str, max_bytes: usize) -> &str {
     &value[start..]
 }
 
-fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
-    entries
-        .iter()
-        .map(|entry| match &entry.content {
-            DisplayContent::Markdown(text) | DisplayContent::Diff(text) => text.len() + 32,
-            DisplayContent::Tool(tool) => {
-                tool.call_id.len() + tool.name.len() + tool.arguments.to_string().len() + 64
-            }
-            DisplayContent::Thinking(thinking) => thinking.content.len() + 32,
-        })
-        .sum()
+fn entry_bytes(entry: &DisplayEntry) -> usize {
+    match &entry.content {
+        DisplayContent::Markdown(text) | DisplayContent::Diff(text) => text.len() + 32,
+        DisplayContent::Tool(tool) => {
+            tool.call_id.len() + tool.name.len() + tool.arguments.to_string().len() + 64
+        }
+        DisplayContent::Thinking(thinking) => thinking.content.len() + 32,
+    }
 }
 
-pub(crate) fn trim_entries(entries: &mut Vec<DisplayEntry>) -> usize {
+fn trim_entries(entries: &mut Vec<DisplayEntry>, bytes: &[usize], total: &mut usize) -> usize {
     const MAX_ENTRIES: usize = 1000;
     const MAX_BYTES: usize = 2 * 1024 * 1024;
     let mut removed = 0;
-    while entries.len() > MAX_ENTRIES || display_entry_bytes(entries) > MAX_BYTES {
-        if entries.len() > MAX_ENTRIES {
-            let count = entries.len() - MAX_ENTRIES;
-            entries.drain(..count);
-            removed += count;
-        } else {
-            entries.remove(0);
-            removed += 1;
-        }
+    while entries.len() - removed > MAX_ENTRIES || *total > MAX_BYTES {
+        *total -= bytes[removed];
+        removed += 1;
     }
+    entries.drain(..removed);
     removed
 }
 
@@ -424,13 +549,13 @@ fn trim_entries_from_end(entries: &mut Vec<DisplayEntry>) -> usize {
     const MAX_ENTRIES: usize = 1000;
     const MAX_BYTES: usize = 2 * 1024 * 1024;
     let mut removed = 0;
-    while entries.len() > MAX_ENTRIES || display_entry_bytes(entries) > MAX_BYTES {
-        if entries.is_empty() {
-            break;
-        }
-        entries.pop();
+    let bytes: Vec<_> = entries.iter().map(entry_bytes).collect();
+    let mut total: usize = bytes.iter().sum();
+    while entries.len() - removed > MAX_ENTRIES || total > MAX_BYTES {
+        total -= bytes[entries.len() - removed - 1];
         removed += 1;
     }
+    entries.truncate(entries.len() - removed);
     removed
 }
 

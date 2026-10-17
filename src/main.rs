@@ -14,6 +14,11 @@ struct Cli {
     /// Optional TOML configuration path.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Target display refresh rate in millihertz for stream redraws (120 Hz by default).
+    /// Pass the verified desktop rate during physical presentation measurements.
+    #[arg(long, default_value_t = 120_000, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+    refresh_rate_millihz: u32,
 }
 
 #[tokio::main]
@@ -34,5 +39,5 @@ async fn main() -> anyhow::Result<()> {
         .try_init()
         .ok();
 
-    app::run(workspace, config).await
+    app::run(workspace, config, cli.refresh_rate_millihz).await
 }
