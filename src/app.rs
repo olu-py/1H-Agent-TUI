@@ -4,7 +4,6 @@ use std::{
     io,
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
     time::Duration,
 };
 
@@ -58,6 +57,7 @@ use command_ops::{
 use command_ops::{command_to_text, todo_to_text};
 
 mod event_loop;
+mod frame_trace;
 mod input;
 mod provider;
 mod provider_editor;
@@ -85,7 +85,6 @@ use provider_editor::{
 };
 
 const MOUSE_WHEEL_SCROLL_LINES: isize = 1;
-const DEFERRED_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 pub use protium_core::model::{
     AgentPhase, DisplayContent, DisplayEntry, DisplayKind, ModelPhase, PendingApproval,
@@ -247,6 +246,7 @@ pub struct App {
     pub active_session: String,
     /// Display projection of the active session.
     pub current: TuiSessionProjection,
+    pub(crate) layout_work: crate::layout_work::LayoutWork,
     /// The globally oldest pending approval surfaced by the snapshot.
     pub approval: Option<ApprovalDisplay>,
     /// Live event stream cursor; events after it are replayed then live.
@@ -754,6 +754,7 @@ impl App {
         if let Some(session_id) = &snapshot.active_session {
             if !self.current.session_id.is_empty() && self.current.session_id != *session_id {
                 // The active session changed: rebuild the projection shell.
+                self.layout_work.cancel_and_wait();
                 self.current = TuiSessionProjection::new(
                     session_id.clone(),
                     AgentMode::parse(&snapshot.mode).unwrap_or_default(),

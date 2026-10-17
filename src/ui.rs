@@ -10,11 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
-use std::{
-    collections::{HashSet, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
-    ops::Range,
-};
+use std::{collections::HashSet, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -38,6 +34,10 @@ use crate::{
     },
 };
 
+pub(crate) use chat::build_background_layout;
+#[cfg(test)]
+pub(crate) use chat::update_message_layout;
+
 #[cfg(test)]
 use crate::input::input_viewport;
 
@@ -45,6 +45,7 @@ struct RenderedMessageLines {
     lines: Vec<Line<'static>>,
     interactions: Vec<Option<InteractionTarget>>,
     thinking_before: Option<usize>,
+    segments: Vec<(u64, u64, u64, usize, usize)>,
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {

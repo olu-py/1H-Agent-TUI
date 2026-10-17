@@ -45,6 +45,140 @@ async fn test_app() -> (App, tempfile::TempDir) {
     (app, temp)
 }
 
+async fn settle_background_layout(app: &mut App, viewport: ratatui::layout::Rect) {
+    let notify = app.layout_work.notify.clone();
+    for _ in 0..30 {
+        ui::update_message_layout(app, viewport);
+        if !app.current.output_layout_dirty
+            && app
+                .current
+                .message_layout
+                .as_ref()
+                .is_some_and(|layout| layout.viewport == viewport)
+        {
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(10), notify.notified())
+            .await
+            .expect("layout completion notification");
+    }
+    panic!("layout did not settle");
+}
+
+#[tokio::test]
+async fn actual_app_background_layout_coalesces_resize_and_rejects_old_session() {
+    use ratatui::layout::Rect;
+    let (mut app, _temp) = test_app().await;
+    app.layout_work.enabled = true;
+    for index in 0..120 {
+        app.current.push_entry(DisplayEntry {
+            kind: DisplayKind::Assistant,
+            content: DisplayContent::Markdown(format!(
+                "entry {index} 中文 **body**\n{}",
+                "abcdef 中文 ".repeat(60)
+            )),
+        });
+    }
+    let first = Rect::new(2, 3, 80, 20);
+    settle_background_layout(&mut app, first).await;
+    app.current.follow_output = false;
+    app.current.output_scroll_top = Some(15);
+    ui::update_message_layout(&mut app, first);
+    let old_byte = app.current.message_layout.as_ref().unwrap().visual_lines[15].start;
+    app.current.output_selection = Some(crate::output::OutputSelection {
+        anchor: 0,
+        active: 80,
+        dragging: false,
+    });
+    let selected = app
+        .current
+        .message_layout
+        .as_ref()
+        .unwrap()
+        .selected_text(app.current.output_selection.unwrap())
+        .unwrap()
+        .to_owned();
+    for width in 40..65 {
+        ui::update_message_layout(&mut app, Rect::new(2, 3, width, 20));
+    }
+    let latest = Rect::new(2, 3, 64, 20);
+    settle_background_layout(&mut app, latest).await;
+    let layout = app.current.message_layout.as_ref().unwrap();
+    assert_eq!(layout.width, 64);
+    assert!(
+        layout.visual_lines[layout.scroll].start <= old_byte
+            && old_byte <= layout.visual_lines[layout.scroll].end
+    );
+    assert_eq!(
+        layout
+            .selected_text(app.current.output_selection.unwrap())
+            .unwrap(),
+        selected
+    );
+    let mut oracle = app.current.layout_snapshot();
+    ui::build_background_layout(&mut oracle, latest);
+    let fresh = oracle.message_layout.unwrap();
+    assert_eq!(layout.text, fresh.text);
+    assert_eq!(layout.visual_lines, fresh.visual_lines);
+    for y in latest.y..latest.y + latest.height {
+        for x in latest.x..latest.x + latest.width {
+            let mut fresh = fresh.clone();
+            fresh.set_scroll(layout.scroll);
+            assert_eq!(layout.hit_test(x, y), fresh.hit_test(x, y));
+        }
+    }
+    ui::update_message_layout(&mut app, Rect::new(2, 3, 30, 20));
+    let mut snapshot = app.handle.snapshot().await.unwrap();
+    snapshot.active_session = Some("replacement".into());
+    app.merge_snapshot(&snapshot, false);
+    app.current.push_entry(DisplayEntry {
+        kind: DisplayKind::User,
+        content: DisplayContent::Markdown("NEW SESSION".into()),
+    });
+    settle_background_layout(&mut app, latest).await;
+    assert_eq!(app.current.session_id, "replacement");
+    assert!(
+        !app.current
+            .message_layout
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("entry 119")
+    );
+    // Closing App joins the actual worker before releasing the projection.
+    ui::update_message_layout(&mut app, Rect::new(2, 3, 20, 20));
+    drop(app);
+}
+
+#[tokio::test]
+async fn background_resize_keeps_exact_wrap_boundary_anchor() {
+    use ratatui::layout::Rect;
+    let (mut app, _temp) = test_app().await;
+    app.layout_work.enabled = true;
+    app.current.push_entry(DisplayEntry {
+        kind: DisplayKind::Assistant,
+        content: DisplayContent::Markdown("x".repeat(4000)),
+    });
+    let wide = Rect::new(0, 0, 80, 10);
+    settle_background_layout(&mut app, wide).await;
+    let row = app
+        .current
+        .message_layout
+        .as_ref()
+        .unwrap()
+        .visual_lines
+        .iter()
+        .position(|line| line.end - line.start == 80 && line.start > 80)
+        .unwrap();
+    app.current.follow_output = false;
+    app.current.output_scroll_top = Some(row);
+    ui::update_message_layout(&mut app, wide);
+    let old_byte = app.current.message_layout.as_ref().unwrap().visual_lines[row].start;
+    settle_background_layout(&mut app, Rect::new(0, 0, 40, 10)).await;
+    let layout = app.current.message_layout.as_ref().unwrap();
+    assert_eq!(layout.visual_lines[layout.scroll].start, old_byte);
+}
+
 #[tokio::test]
 async fn model_refresh_channel_is_bounded_to_one_result() {
     let (app, _temp) = test_app().await;
@@ -89,6 +223,330 @@ async fn facade_renders_a_frame_with_test_backend() {
     let content = terminal.backend().buffer().content().to_vec();
     assert!(!content.is_empty());
     assert!(content.iter().any(|cell| cell.symbol() != " "));
+}
+
+#[tokio::test]
+async fn streaming_revision_rewraps_only_the_changed_message_segment() {
+    let (mut app, _temp) = test_app().await;
+    for index in 0..8 {
+        app.current.push_entry(DisplayEntry {
+            kind: DisplayKind::Assistant,
+            content: DisplayContent::Markdown(format!("stable message {index} 中文 content")),
+        });
+    }
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("initial segmented layout");
+    let initial_rebuilds = app.current.layout_segment_rebuild_count;
+    let prefix_text = app.current.message_layout.as_ref().unwrap().lines[0]
+        .text
+        .as_ptr();
+    let stable_ids = app.current.entry_ids[..app.current.entry_ids.len() - 1].to_vec();
+    assert!(initial_rebuilds >= 8);
+    assert_eq!(
+        app.current.layout_segment_cache.len(),
+        app.current.entry_ids.len()
+    );
+
+    let initial_visits = app.current.layout_entry_visit_count;
+    app.current
+        .handle_event(&protium_core::protocol::Event::TextDelta {
+            delta: " and a new revision".into(),
+        });
+    app.current
+        .handle_event(&protium_core::protocol::Event::TextDelta {
+            delta: " 中文\nnext line".into(),
+        });
+    assert_eq!(
+        app.current.output_dirty_tail,
+        Some(app.current.entries.len() - 1)
+    );
+    assert!(
+        app.current.message_layout.is_none(),
+        "dirty coordinates must not be exposed"
+    );
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("updated segmented layout");
+    assert_eq!(
+        app.current.message_layout.as_ref().unwrap().lines[0]
+            .text
+            .as_ptr(),
+        prefix_text,
+        "the actual projection/draw path must preserve the stable prefix"
+    );
+
+    assert_eq!(
+        app.current.layout_segment_rebuild_count,
+        initial_rebuilds + 1
+    );
+    assert!(stable_ids.iter().all(|id| {
+        app.current
+            .layout_segment_cache
+            .get(id)
+            .is_some_and(|segment| segment.revision == 0)
+    }));
+    assert_eq!(
+        app.current.layout_segment_cache.len(),
+        app.current.entry_ids.len()
+    );
+    assert_eq!(app.current.layout_entry_visit_count, initial_visits + 1);
+    let incremental_buffer = terminal.backend().buffer().clone();
+    let incremental_text = app.current.message_layout.as_ref().unwrap().text.clone();
+    let positions = |app: &App| {
+        let layout = app.current.message_layout.as_ref().unwrap();
+        (layout.viewport.y..layout.viewport.bottom())
+            .flat_map(|row| {
+                (layout.viewport.x..layout.viewport.right())
+                    .map(move |column| layout.hit_test(column, row))
+            })
+            .collect::<Vec<_>>()
+    };
+    let incremental_positions = positions(&app);
+    app.current.invalidate_output_layout();
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("full reconciliation oracle");
+    assert_eq!(terminal.backend().buffer(), &incremental_buffer);
+    assert_eq!(
+        app.current.message_layout.as_ref().unwrap().text,
+        incremental_text
+    );
+    assert_eq!(positions(&app), incremental_positions);
+    terminal.backend_mut().resize(54, 24);
+    terminal
+        .resize(ratatui::layout::Rect::new(0, 0, 54, 24))
+        .expect("resize");
+    let visits_before_resize = app.current.layout_entry_visit_count;
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("resize reconciliation");
+    assert_eq!(
+        app.current.layout_entry_visit_count,
+        visits_before_resize + app.current.entries.len()
+    );
+}
+
+/// Isolated evidence run; backend fixtures are prepared offline by the runner.
+/// Keeps production projection limits and measures AppHandle -> projection -> draw.
+#[tokio::test]
+#[ignore = "requires PROTIUM_P2_FIXTURE_ROOT and writes performance evidence"]
+async fn actual_history_tail_prepend_resize_evidence() {
+    let root = PathBuf::from(std::env::var("PROTIUM_P2_FIXTURE_ROOT").expect("fixture root"));
+    let mut records = Vec::new();
+    for count in [1_000, 10_000, 100_000] {
+        let directory = root.join(count.to_string());
+        let workspace = directory.join("workspace").canonicalize().unwrap();
+        let mut config = Config::default();
+        config.model_metadata.fetch = false;
+        config.data_dir = directory.join("data");
+        let handle = AppService::start(CoreConfig {
+            workspace: workspace.clone(),
+            config: config.clone(),
+            data_dir: config.data_dir.clone(),
+            event_capacity: 64,
+            event_max_bytes: 1024 * 1024,
+            approval_timeout: Duration::from_secs(60),
+            message_page_size: 100,
+        })
+        .await
+        .unwrap();
+        let snapshot = handle.snapshot().await.unwrap();
+        assert!(snapshot.active_session.is_some());
+        let mut app = build_app(handle, snapshot, workspace, config)
+            .await
+            .unwrap();
+        // The same resident working set under each backend history size.
+        while app.current.entries.len() < 900 && app.current.history_has_more {
+            app.load_older_history().await.unwrap();
+        }
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let resident = app.current.entries.len();
+        assert!(resident <= 1_000);
+        let mut samples = Vec::new();
+        let visits = app.current.layout_entry_visit_count;
+        for _ in 0..100 {
+            let started = std::time::Instant::now();
+            app.current
+                .handle_event(&protium_core::protocol::Event::TextDelta { delta: "x".into() });
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let tail_visits = app.current.layout_entry_visit_count - visits;
+        assert_eq!(tail_visits, 100, "one changed entry per real draw");
+        let check_oracle = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer().clone();
+            let layout = app.current.message_layout.as_ref().unwrap();
+            let coords = (layout.viewport.y..layout.viewport.bottom())
+                .flat_map(|y| {
+                    (layout.viewport.x..layout.viewport.right()).map(move |x| layout.hit_test(x, y))
+                })
+                .collect::<Vec<_>>();
+            let selection = crate::output::OutputSelection {
+                anchor: 0,
+                active: layout.text.len(),
+                dragging: false,
+            };
+            let selected = layout.selected_text(selection).unwrap_or("").to_string();
+            app.current.invalidate_output_layout();
+            terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+            assert_eq!(terminal.backend().buffer(), &buffer);
+            let fresh = app.current.message_layout.as_ref().unwrap();
+            let fresh_coords = (fresh.viewport.y..fresh.viewport.bottom())
+                .flat_map(|y| {
+                    (fresh.viewport.x..fresh.viewport.right()).map(move |x| fresh.hit_test(x, y))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(fresh_coords, coords);
+            assert_eq!(fresh.selected_text(selection).unwrap_or(""), selected);
+        };
+        check_oracle(&mut app, &mut terminal);
+        let started = std::time::Instant::now();
+        app.load_older_history().await.unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let prepend_ms = started.elapsed().as_secs_f64() * 1000.0;
+        check_oracle(&mut app, &mut terminal);
+        terminal.backend_mut().resize(72, 40);
+        terminal.resize(Rect::new(0, 0, 72, 40)).unwrap();
+        let started = std::time::Instant::now();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let resize_ms = started.elapsed().as_secs_f64() * 1000.0;
+        check_oracle(&mut app, &mut terminal);
+        records.push(serde_json::json!({"backendMessages":count,"residentEntries":resident,
+            "tailEntryVisits":tail_visits,"tailMs":samples,"prependMs":prepend_ms,"resizeMs":resize_ms,
+            "bufferHitSelectionOracle":"PASS"}));
+        app.handle.shutdown().await.unwrap();
+    }
+    std::fs::write(
+        root.join("actual-path.json"),
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Replays the core's shared conformance corpus through the facade's
+#[tokio::test]
+#[ignore = "requires isolated PROTIUM_P2_FIXTURE_ROOT; writes repeated background evidence"]
+async fn actual_background_history_repeated_evidence() {
+    use ratatui::{Terminal, layout::Rect};
+    async fn draw_ready(terminal: &mut Terminal<TestBackend>, app: &mut App) {
+        let notify = app.layout_work.notify.clone();
+        for _ in 0..30 {
+            terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+            if !app.current.output_layout_dirty && app.current.message_layout.is_some() {
+                return;
+            }
+            tokio::time::timeout(Duration::from_secs(10), notify.notified())
+                .await
+                .unwrap();
+        }
+        panic!("layout completion missing");
+    }
+    fn oracle(terminal: &mut Terminal<TestBackend>, app: &mut App) {
+        let buffer = terminal.backend().buffer().clone();
+        let actual = app.current.message_layout.as_ref().unwrap().clone();
+        app.layout_work.enabled = false;
+        app.current.invalidate_output_layout();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let expected = app.current.message_layout.as_ref().unwrap();
+        assert_eq!(terminal.backend().buffer(), &buffer);
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(actual.visual_lines, expected.visual_lines);
+        let selection = crate::output::OutputSelection {
+            anchor: 0,
+            active: actual.text.len(),
+            dragging: false,
+        };
+        assert_eq!(
+            actual.selected_text(selection),
+            expected.selected_text(selection)
+        );
+        for y in actual.viewport.y..actual.viewport.bottom() {
+            for x in actual.viewport.x..actual.viewport.right() {
+                assert_eq!(actual.hit_test(x, y), expected.hit_test(x, y));
+            }
+        }
+        app.layout_work.enabled = true;
+    }
+    let root = PathBuf::from(std::env::var("PROTIUM_P2_FIXTURE_ROOT").unwrap());
+    let mut records = Vec::new();
+    for count in [1_000, 10_000, 100_000] {
+        let directory = root.join(count.to_string());
+        let workspace = directory.join("workspace").canonicalize().unwrap();
+        let mut config = Config::default();
+        config.model_metadata.fetch = false;
+        config.data_dir = directory.join("data");
+        let handle = AppService::start(CoreConfig {
+            workspace: workspace.clone(),
+            config: config.clone(),
+            data_dir: config.data_dir.clone(),
+            event_capacity: 64,
+            event_max_bytes: 1024 * 1024,
+            approval_timeout: Duration::from_secs(60),
+            message_page_size: 100,
+        })
+        .await
+        .unwrap();
+        let snapshot = handle.snapshot().await.unwrap();
+        let mut app = build_app(handle, snapshot, workspace, config)
+            .await
+            .unwrap();
+        while app.current.entries.len() < 900 && app.current.history_has_more {
+            app.load_older_history().await.unwrap();
+        }
+        assert_eq!(app.current.entries.len(), 900);
+        let baseline = app.current.entries.clone();
+        let next_before = app.current.history_next_before;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        app.layout_work.enabled = true;
+        draw_ready(&mut terminal, &mut app).await;
+        let mut tail_ms = Vec::new();
+        let visits = app.current.layout_entry_visit_count;
+        for _ in 0..100 {
+            let started = std::time::Instant::now();
+            app.current
+                .handle_event(&protium_core::protocol::Event::TextDelta { delta: "x".into() });
+            draw_ready(&mut terminal, &mut app).await;
+            tail_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        assert_eq!(app.current.layout_entry_visit_count - visits, 100);
+        oracle(&mut terminal, &mut app);
+        let mut prepend_ms = Vec::new();
+        let mut resize_ms = Vec::new();
+        for _ in 0..20 {
+            // Reset the same bounded window outside the measured operation.
+            app.current.replace_history(baseline.clone());
+            app.current.history_has_more = true;
+            app.current.history_next_before = next_before;
+            draw_ready(&mut terminal, &mut app).await;
+            let started = std::time::Instant::now();
+            app.load_older_history().await.unwrap();
+            draw_ready(&mut terminal, &mut app).await;
+            prepend_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(app.current.entries.len(), 1000);
+            oracle(&mut terminal, &mut app);
+            for width in [72, 120] {
+                terminal.backend_mut().resize(width, 40);
+                terminal.resize(Rect::new(0, 0, width, 40)).unwrap();
+                let started = std::time::Instant::now();
+                draw_ready(&mut terminal, &mut app).await;
+                resize_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                oracle(&mut terminal, &mut app);
+            }
+        }
+        records.push(serde_json::json!({"backendMessages":count,"residentEntries":900,"residentAfterPrepend":1000,
+            "tailMs":tail_ms,"prependMs":prepend_ms,"resizeMs":resize_ms,"bufferHitSelectionOracle":"PASS",
+            "method":"actual App, Notify-driven completion + draw; reset before prepend excluded; background branch enabled"}));
+        app.handle.shutdown().await.unwrap();
+    }
+    std::fs::write(
+        root.join("actual-background-path.json"),
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Replays the core's shared conformance corpus through the facade's
@@ -404,6 +862,54 @@ fn should_coalesce_stream_redraw_is_a_phase_barrier() {
         "other",
         &envelope(ProtocolEvent::TextDelta { delta: "d".into() }),
     ));
+}
+
+#[tokio::test]
+async fn deferred_redraw_uses_120hz_deadline_and_does_not_reset_on_new_events() {
+    let start = tokio::time::Instant::now();
+    let interval = event_loop::frame_interval(120_000);
+    let mut timer = None;
+    let mut next_deadline = None;
+    event_loop::schedule_deferred_redraw(&mut timer, &mut next_deadline, interval);
+    let first = timer.as_ref().expect("scheduled").deadline();
+    let delay = first.duration_since(start);
+    assert!(delay >= Duration::from_nanos(8_333_333));
+    assert!(delay <= Duration::from_nanos(9_333_333));
+
+    event_loop::schedule_deferred_redraw(&mut timer, &mut next_deadline, interval);
+    assert_eq!(timer.as_ref().expect("still scheduled").deadline(), first);
+
+    tokio::time::sleep_until(first).await;
+    timer = None;
+    event_loop::advance_deferred_redraw_deadline(&mut next_deadline, interval);
+    let second = next_deadline.expect("phase carried to the next frame");
+    let phase_delta = second.duration_since(first).as_nanos();
+    assert!(phase_delta >= 8_333_333);
+    assert_eq!(phase_delta % interval.as_nanos(), 0);
+
+    // If drawing or event handling misses multiple slots, skip to the next
+    // future phase instead of scheduling an immediate catch-up/busy frame.
+    next_deadline = Some(tokio::time::Instant::now() - Duration::from_nanos(25_000_000));
+    event_loop::schedule_deferred_redraw(&mut timer, &mut next_deadline, interval);
+    assert!(
+        timer
+            .as_ref()
+            .expect("scheduled after missed slots")
+            .deadline()
+            > tokio::time::Instant::now()
+    );
+}
+
+#[test]
+fn frame_interval_accepts_verified_non_integer_refresh_rates() {
+    assert_eq!(
+        event_loop::frame_interval(119_880),
+        Duration::from_nanos(8_341_675)
+    );
+    assert_eq!(
+        event_loop::frame_interval(180_000),
+        Duration::from_nanos(5_555_555)
+    );
 }
 
 #[tokio::test]
