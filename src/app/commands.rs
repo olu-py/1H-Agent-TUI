@@ -219,7 +219,13 @@ impl App {
             self.sync_all().await?;
             return Ok(());
         }
-        self.handle.activate_session(session_id).await?;
+        if let Err(error) = self.handle.activate_session(session_id).await {
+            if let Some(message) = recoverable_activation_error(&error) {
+                self.current.status = message;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         self.sync_all().await?;
         Ok(())
     }
@@ -355,6 +361,11 @@ impl App {
         let _ = load_provider_models(self, false).await;
         Ok(())
     }
+}
+
+fn recoverable_activation_error(error: &protium_core::protocol::ApiError) -> Option<String> {
+    (error.kind == protium_core::protocol::ApiErrorKind::Conflict)
+        .then(|| secrets::redact(&error.message))
 }
 
 /// Applies one live envelope with cursor dedup: an envelope at or below the
@@ -619,5 +630,20 @@ pub(super) fn todo_status_from_wire(status: &str) -> TodoStatus {
         "in_progress" => TodoStatus::InProgress,
         "done" => TodoStatus::Done,
         _ => TodoStatus::Pending,
+    }
+}
+
+#[cfg(test)]
+mod activation_error_tests {
+    use super::recoverable_activation_error;
+    use protium_core::protocol::ApiError;
+
+    #[test]
+    fn activation_conflict_is_recoverable_but_internal_error_is_not() {
+        assert_eq!(
+            recoverable_activation_error(&ApiError::conflict("runtime capacity reached")),
+            Some("runtime capacity reached".into())
+        );
+        assert!(recoverable_activation_error(&ApiError::internal("storage failed")).is_none());
     }
 }
