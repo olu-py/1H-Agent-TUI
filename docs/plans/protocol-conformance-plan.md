@@ -1,6 +1,6 @@
 # 协议一致性夹具与多端适配规范化实施计划
 
-> 状态：已归档。本文记录 conformance 初次实施，当前维护以 `.agents/guides/ui-contract.md` 和独立 [1H-Agent-core](https://github.com/olu-py/1H-Agent-core) 仓库为准。
+> 状态：已归档。本文记录 conformance 初次实施，当前维护以 `../../../.agents/guides/tui/ui-contract.md`、`../../../.agents/guides/core/ui-contract.md` 和独立 [1H-Agent-core](https://github.com/olu-py/1H-Agent-core) 仓库为准。
 > 文中的路径已按 core 抽离后的仓库结构更新，不再表示本仓库包含 core 源码。
 
 ## 背景与目标
@@ -52,9 +52,9 @@ conformance.rs `#[cfg(test)]` 内：
   - 测试 `corpus_replay_advances_cursor_and_dedups`：每场景从 event_cursor=0 回放，断言终 cursor==最后信封；重放同批（陈旧 cursor）状态不变。
 
 ### 4. 文档与流程固化
-- `.agents/guides/ui-contract.md`：入口加 conformance.rs 与 JSON 产物；验证节加「新增事件 -> 场景 + 变体目录 + JSON 无漂移 + 契约测试 + TUI 回放」清单；注明 test-util 与 `--all-features` 语义（保持 ≤50 行）。
+- `../../../.agents/guides/tui/ui-contract.md`：入口加 conformance.rs 与 JSON 产物；验证节加「新增事件 -> 场景 + 变体目录 + JSON 无漂移 + 契约测试 + TUI 回放」清单；注明 test-util 与 `--all-features` 语义。
 - `AGENTS.md`：任务路由表把协议夹具/契约测试指向独立 core 仓库与 UI Contract。
-- `.agents/guides/tui.md`：验证节加夹具回放一行。
+- `../../../.agents/guides/tui/tui.md`：验证节加夹具回放一行。
 - 新建 `.github/PULL_REQUEST_TEMPLATE.md`：勾选式事件链速查（动 protocol.rs/bridge.rs ⇒ 绑定/JSON 漂移、场景覆盖、指南同步、各端映射）。
 
 ### 5. 验证（跨模块档位，一次全过）
