@@ -199,7 +199,7 @@ async fn apply_home_selection(
     session_id: &str,
     selection: &HomeSelection,
 ) -> Result<()> {
-    if selection.provider.id() != config.provider.id() {
+    if should_apply_home_provider_config(&config.provider, &selection.provider) {
         let _ = secrets::api_key_cached(selection.provider.preset, selection.provider.id());
         handle
             .set_provider_config(selection.provider.clone())
@@ -215,6 +215,13 @@ async fn apply_home_selection(
         .execute_command(Some(session_id.to_owned()), mode_command)
         .await?;
     Ok(())
+}
+
+fn should_apply_home_provider_config(
+    current: &protium_core::config::ProviderConfig,
+    selected: &protium_core::config::ProviderConfig,
+) -> bool {
+    current.id() != selected.id() || current.model != selected.model
 }
 
 pub(super) async fn build_app(
@@ -641,4 +648,29 @@ pub(super) fn advance_deferred_redraw_deadline(
 pub(super) fn frame_interval(refresh_rate_millihz: u32) -> Duration {
     let refresh_rate_millihz = u64::from(refresh_rate_millihz.clamp(1, 1_000_000));
     Duration::from_nanos(1_000_000_000_000 / refresh_rate_millihz)
+}
+
+#[cfg(test)]
+mod home_selection_tests {
+    use super::should_apply_home_provider_config;
+    use protium_core::config::ProviderConfig;
+
+    #[test]
+    fn applies_model_change_for_same_provider() {
+        let current = ProviderConfig::default();
+        let mut selected = current.clone();
+        selected.model = "home-selected-model".into();
+
+        assert!(should_apply_home_provider_config(&current, &selected));
+    }
+
+    #[test]
+    fn skips_unchanged_provider_and_applies_provider_change() {
+        let current = ProviderConfig::default();
+        assert!(!should_apply_home_provider_config(&current, &current));
+
+        let mut selected = current.clone();
+        selected.id = "custom-home-selection".into();
+        assert!(should_apply_home_provider_config(&current, &selected));
+    }
 }
