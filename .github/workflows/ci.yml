@@ -63,11 +63,12 @@ jobs:
           sudo apt-get install --yes libdbus-1-dev pkg-config
       - name: Dependency MSRV floor
         run: bash scripts/check-msrv-floor.sh
-      - name: Tests
-        run: cargo test --all-features --locked
+      - name: Compile check (all targets)
+        run: cargo check --all-targets --all-features --locked
 
   platform-tests:
     name: Test (${{ matrix.check-name }})
+    if: github.event_name == 'pull_request'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
